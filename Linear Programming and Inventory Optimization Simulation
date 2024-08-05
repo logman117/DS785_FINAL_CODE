@@ -1,0 +1,250 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.table import Table
+from datetime import datetime, timedelta
+import numpy as np
+from scipy.optimize import linprog
+from concurrent.futures import ThreadPoolExecutor
+
+# Load the necessary data
+final_results = pd.read_csv("FINAL_RESULTS_COMPARISON_MONTHLY_prophet_cnn_lstm.csv", parse_dates=['Month'])
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+historic_sales = pd.read_csv("historic_sales1.csv", parse_dates=['CustomerRequestedDate'])
+
+# Prepare predictions_df
+predictions_df = final_results.copy()
+predictions_df['Month'] = pd.to_datetime(predictions_df['Month'], format='%m/%d/%Y')
+predictions_df['MinimumOrderQuantity'] = predictions_df['MinimumOrderQuantity'].fillna(1).replace('', 1)
+predictions_df['MaximumOrderQuantity'] = predictions_df['MaximumOrderQuantity'].fillna(999999).replace('', 999999)
+
+# Filter for QuantityOnHand_as_of_02012024
+quantity_on_hand_02012024 = predictions_df[predictions_df['Month'] == '2024-02-01'].set_index('ItemNum')['QtyOnHand']
+predictions_df['QuantityOnHand_as_of_02012024'] = predictions_df['ItemNum'].map(quantity_on_hand_02012024).fillna(0)
+
+# Aggregate data directly for each item (single 4-month cycle)
+grouped_df = predictions_df.groupby('ItemNum').agg({
+    'Prediction': 'sum',
+    'ActualLeadTime': 'mean',
+    'MinimumOrderQuantity': 'mean',
+    'MaximumOrderQuantity': 'mean',
+    'QuantityOnHand_as_of_02012024': 'first',
+    'CostUSD_per_unit': 'mean',
+    'PriceUSD_per_unit': 'mean',
+    'MarginUSD_per_unit': 'mean',
+}).reset_index()
+
+# Calculate the standard deviation of the predicted demand for each item
+std_dev_df = predictions_df.groupby('ItemNum')['Prediction'].std(ddof=0).reset_index()
+std_dev_df.columns = ['ItemNum', 'DemandStdDev']
+
+# Merge the standard deviation data into the grouped_df
+grouped_df = grouped_df.merge(std_dev_df, on='ItemNum', how='left')
+
+# Ensure non-zero lead times
+grouped_df['ActualLeadTime'] = grouped_df['ActualLeadTime'].replace(0, 1)
+
+# Safety stock formula: z * sigma_d * sqrt(Lead Time in days)
+# Assuming z-score for 95% service level is 1.65
+z_score = 1.65
+
+# Calculate the monthly demand
+monthly_demand = grouped_df['Prediction'] / 4
+
+# Calculate safety stock to cover 3 months of demand
+safety_stock_months = 3
+grouped_df['SafetyStock'] = z_score * grouped_df['DemandStdDev'] * np.sqrt(grouped_df['ActualLeadTime']) + safety_stock_months * monthly_demand
+
+# Calculate Lead Time Demand
+# Lead Time Demand = ActualLeadTime (days) * (Monthly Demand / Days in Month)
+days_in_month = 30
+grouped_df['LeadTimeDemand'] = grouped_df['ActualLeadTime'] * (monthly_demand / days_in_month)
+
+# Calculate Reorder Point
+grouped_df['ReorderPoint'] = grouped_df['LeadTimeDemand'] + grouped_df['SafetyStock']
+
+# Define the cost function coefficients (holding costs per item)
+holding_costs = grouped_df['CostUSD_per_unit'].values * 0.2  # assuming 20% holding cost per unit
+
+# Decision variable bounds (order quantities)
+bounds = [(row['MinimumOrderQuantity'], row['MaximumOrderQuantity']) for _, row in grouped_df.iterrows()]
+
+# Define constraints
+# Ensure inventory levels are above safety stock levels and meet demand
+A = np.eye(len(grouped_df))  # Identity matrix for linear programming constraints
+b = (grouped_df['Prediction'] + grouped_df['SafetyStock'] - grouped_df['QuantityOnHand_as_of_02012024']).values
+
+# Objective function (minimize holding costs)
+c = holding_costs
+
+# Solving the linear program
+result = linprog(c, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+
+# Check if the optimization was successful
+if result.success:
+    grouped_df['OptimalOrderQty'] = result.x
+else:
+    grouped_df['OptimalOrderQty'] = np.nan  # Assign NaN if the optimization failed
+
+# Filter historic_sales to include only ItemNum values present in predictions_df
+valid_item_nums = set(predictions_df['ItemNum'])
+historic_sales = historic_sales[historic_sales['ItemNum'].isin(valid_item_nums)]
+
+# Ensure CustomerRequestedDate is within the desired range
+historic_sales['CustomerRequestedDate'] = pd.to_datetime(historic_sales['CustomerRequestedDate'], format='%m/%d/%Y %H:%M')
+historic_sales = historic_sales[(historic_sales['CustomerRequestedDate'] >= '2024-02-01') & (historic_sales['CustomerRequestedDate'] <= '2024-05-01')]
+historic_sales = historic_sales.sort_values(by='CustomerRequestedDate')
+
+# Function to simulate inventory management for a chunk of data
+def simulate_inventory(chunk):
+    inventory_levels = grouped_df.set_index('ItemNum')['QuantityOnHand_as_of_02012024'].to_dict()
+    backorder_levels = {item_num: 0 for item_num in inventory_levels.keys()}
+    projected_ship_dates = {item_num: None for item_num in inventory_levels.keys()}
+    order_history = []
+
+    for idx, row in chunk.iterrows():
+        item_num = row['ItemNum']
+        order_qty = row['OrderQty']
+        current_inventory = inventory_levels.get(item_num, 0)
+
+        # Fulfill the order
+        if current_inventory >= order_qty:
+            inventory_levels[item_num] -= order_qty
+            order_history.append({
+                'Date': row['CustomerRequestedDate'], 
+                'ItemNum': item_num, 
+                'Stockout': False, 
+                'OrderQty': order_qty, 
+                'FulfilledQty': order_qty, 
+                'QtyInBackorder': backorder_levels[item_num], 
+                'ProjectedShipDate': row['CustomerRequestedDate'], 
+                'QtyOnHand': inventory_levels[item_num]
+            })
+        else:
+            # Record a stockout
+            backorder_qty = order_qty - current_inventory
+            projected_ship_date = row['CustomerRequestedDate'] + timedelta(days=int(grouped_df[grouped_df['ItemNum'] == item_num]['ActualLeadTime'].values[0]))
+
+            backorder_levels[item_num] += backorder_qty
+            if not projected_ship_dates[item_num] or projected_ship_dates[item_num] < projected_ship_date:
+                projected_ship_dates[item_num] = projected_ship_date
+
+            order_history.append({
+                'Date': row['CustomerRequestedDate'], 
+                'ItemNum': item_num, 
+                'Stockout': True, 
+                'OrderQty': order_qty, 
+                'FulfilledQty': current_inventory, 
+                'QtyInBackorder': backorder_levels[item_num], 
+                'ProjectedShipDate': projected_ship_dates[item_num],
+                'QtyOnHand': 0
+            })
+            inventory_levels[item_num] = 0
+
+        # Check if we need to reorder
+        reorder_point = grouped_df.loc[grouped_df['ItemNum'] == item_num, 'ReorderPoint'].values[0]
+        if current_inventory < reorder_point:
+            lead_time = int(grouped_df.loc[grouped_df['ItemNum'] == item_num, 'ActualLeadTime'].values[0])
+            optimal_order_qty = grouped_df.loc[grouped_df['ItemNum'] == item_num, 'OptimalOrderQty'].values[0]
+            if not np.isnan(optimal_order_qty):
+                inventory_levels[item_num] += optimal_order_qty
+                order_history.append({
+                    'Date': row['CustomerRequestedDate'] + timedelta(days=lead_time), 
+                    'ItemNum': item_num, 
+                    'Stockout': False, 
+                    'OrderQty': optimal_order_qty, 
+                    'FulfilledQty': optimal_order_qty, 
+                    'QtyInBackorder': backorder_levels[item_num], 
+                    'ProjectedShipDate': row['CustomerRequestedDate'] + timedelta(days=lead_time),
+                    'QtyOnHand': inventory_levels[item_num]
+                })
+
+    return order_history
+
+# Split the data into chunks for parallel processing
+chunks = np.array_split(historic_sales, 10)
+
+# Use ThreadPoolExecutor for parallel processing
+with ThreadPoolExecutor(max_workers=10) as executor:
+    results = executor.map(simulate_inventory, chunks)
+
+# Combine results from all chunks
+order_history_combined = [item for sublist in results for item in sublist]
+
+# Convert combined order history to a DataFrame for analysis
+order_history_df = pd.DataFrame(order_history_combined)
+
+# Save the results to CSV files
+grouped_df.to_csv('grouped_results_13.csv', index=False)
+order_history_df.to_csv('order_history_results_5.csv', index=False)
+
+# Calculate stockout rate for simulated inventory
+simulated_stockout_rate = order_history_df['Stockout'].mean()
+print(f"Simulated Stockout Rate: {simulated_stockout_rate:.2%}")
+
+# Calculate stockout rate for historical sales
+def calculate_historical_stockout_rate(historic_sales):
+    historical_stockouts = []
+    
+    for idx, row in historic_sales.iterrows():
+        order_qty = row['OrderQty']
+        qty_on_hand = row['QtyOnHand']
+        
+        if qty_on_hand >= order_qty:
+            historical_stockouts.append(False)
+        else:
+            historical_stockouts.append(True)
+    
+    return np.mean(historical_stockouts)
+
+historical_stockout_rate = calculate_historical_stockout_rate(historic_sales)
+print(f"Historical Stockout Rate: {historical_stockout_rate:.2%}")
+
+# Calculate projected on-hand inventory value in USD
+def calculate_inventory_value(df, cost_df):
+    latest_inventory_levels = df.groupby('ItemNum')['QtyOnHand'].last()
+    cost_per_unit = cost_df.set_index('ItemNum')['CostUSD_per_unit']
+    inventory_value = (latest_inventory_levels * cost_per_unit).sum()
+    return inventory_value
+
+simulated_inventory_value = calculate_inventory_value(order_history_df, grouped_df)
+historical_inventory_value = calculate_inventory_value(historic_sales, grouped_df)
+
+print(f"Simulated Inventory Value: ${simulated_inventory_value:.2f} Million")
+print(f"Historical Inventory Value: ${historical_inventory_value:.2f} Million")
+
+# Create a DataFrame for the performance metrics
+performance_metrics = pd.DataFrame({
+    'Model': ['Current', 'Linear Programmed'],
+    'Inventory Availability': [f"{(1 - historical_stockout_rate) * 100:.1f}%", f"{(1 - simulated_stockout_rate) * 100:.1f}%"],
+    'Projected On Hand Inventory in USD by end of May': [f"${historical_inventory_value / 1e6:.2f} Million", f"${simulated_inventory_value / 1e6:.2f} Million"]
+})
+
+# Print the performance metrics DataFrame
+print(performance_metrics)
+
+# Function to create a table like the provided image
+def create_performance_table(df):
+    fig, ax = plt.subplots(figsize=(20, 8))
+    ax.set_axis_off()
+    tbl = Table(ax, bbox=[0, 0, 1, 1])
+
+    n_rows, n_cols = df.shape
+    width, height = 1.0 / n_cols, 1.0 / (n_rows + 1)
+
+    # Add headers
+    for i, column in enumerate(df.columns):
+        cell = tbl.add_cell(0, i, width, height, text=column, loc='center', facecolor='lightgrey')
+        cell.get_text().set_fontsize(16)
+
+    # Add data rows
+    for row in range(n_rows):
+        for col in range(n_cols):
+            cell = tbl.add_cell(row + 1, col, width, height, text=df.iat[row, col], loc='center', facecolor='white')
+            cell.get_text().set_fontsize(22)
+
+    ax.add_table(tbl)
+    plt.title("Inventory Performance Metrics From FEB24 to MAY 24", fontsize=22, weight='bold')
+    plt.show()
+
+# Display the table
+create_performance_table(performance_metrics)
