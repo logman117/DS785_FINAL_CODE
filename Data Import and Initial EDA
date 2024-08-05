@@ -285,7 +285,7 @@ historic_sales.reset_index(drop=True, inplace=True)
 
 columns_to_keep = [
     'ItemNum', 'CostUSD', 'MarginUSD', 'PriceUSD', 'OrderQty', 
-    'CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit'
+    'CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'QtyOnHand'
 ]
 
 # Create a new DataFrame with only the selected columns
@@ -330,7 +330,7 @@ orders_by_month[sum_columns] = orders_by_month[sum_columns].fillna(0)
 orders_by_month[avg_columns] = orders_by_month[avg_columns].fillna(0)
 
 # Add columns that should be just included
-include_columns = ['ABC', 'SupplierID', 'CountryOfOrigin', 'SafetyStock', 'SafetyTime', 'ReorderPoint', 
+include_columns = ['ABC', 'SupplierID', 'CountryOfOrigin', 'SafetyStock', 'SafetyTime', 'ReorderPoint', "QtyOnHand",
                    'MaximumInventory', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SafetyStockNotAllowed', 'ItemGroup']
 
 # We will use the most frequent value (mode) for the included columns for each month and ItemNum
