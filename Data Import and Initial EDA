@@ -28,7 +28,7 @@ def dc_connect(driver, server, database, port, trusted_connection='yes'):
     con = pyodbc.connect(connection_string)
     return con
 
-# Define your SQL query
+# SQL query
 my_sql = """SELECT f.*,
        d.ItemDescription,
        d.CountryOfOrigin,
@@ -50,7 +50,7 @@ my_sql = """SELECT f.*,
        s.CostUSD,
        s.MarginUSD,
        s.PriceUSD,
-       cust.CustomerName -- Adding CustomerName
+       cust.CustomerName
 FROM [iCube].[dbo].[Fact_SalesLineFulfillmentsE2E] f
 LEFT JOIN (
     SELECT ItemNum, 
@@ -196,7 +196,6 @@ else:
 
 print(historic_sales.columns)
 
-
 mask = historic_sales['OrderShipConstraint'].isin(['Ship Set Complete', 'Ship Order Complete'])
 
 # Then, use the mask to filter the DataFrame and update 'PlannedShipFromDC'
@@ -294,8 +293,8 @@ historic_sales_test = historic_sales[columns_to_keep].copy()
 # Display the new DataFrame
 historic_sales_test.head()
 
-# Final DataFrame
-###########################
+############################ Calculate and save orders_by_month ############################
+
 
 # Ensure 'CustomerRequestedDate' is part of the DataFrame and in datetime format
 historic_sales['CustomerRequestedDate'] = pd.to_datetime(historic_sales['CustomerRequestedDate'])
