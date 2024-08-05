@@ -1039,6 +1039,8 @@ print(f"Final Summarized Results:\n{summarized_results.head()}")
 
 # Visuals/graphics/figures
 
+
+
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.table import Table
@@ -1076,8 +1078,6 @@ models = [
     "Prophet", 
     "CNN-LSTM_Prophet", 
     "Historic Moving Average", 
-    "LES", 
-    "LightGBM", 
     "ARIMA_SARIMA"
 ]
 
@@ -1086,8 +1086,6 @@ average_mae = [
     prophet_results['MAE'].mean(),
     prophet_cnn_lstm_results['MAE'].mean(),
     historic_moving_avg_results['MAE'].mean(),
-    les_results['MAE'].mean(),
-    lgbm_results['MAE'].mean(),
     ARIMA_SARIMA_results['MAE'].mean()
 ]
 
@@ -1096,8 +1094,6 @@ total_absolute_error = [
     prophet_results['ABS_DIFF_VALUE'].sum(),
     prophet_cnn_lstm_results['ABS_DIFF_VALUE'].sum(),
     historic_moving_avg_results['ABS_DIFF_VALUE'].sum(),
-    les_results['ABS_DIFF_VALUE'].sum(),
-    lgbm_results['ABS_DIFF_VALUE'].sum(),
     ARIMA_SARIMA_results['ABS_DIFF_VALUE'].sum()
 ]
 
@@ -1161,4 +1157,53 @@ plt.xticks(rotation=45)
 # Format y-axis with commas for readability
 plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.2f}M'))
 
+plt.show()
+
+# Create subplots for side-by-side visualization
+fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(20, 8))
+
+# Define colors for the bars
+colors = ['blue', 'orange', 'green', 'red', 'purple']
+
+# Plot Total Absolute Error in Million USD
+axes[0].bar(results_df['Forecast Model'], results_df['Absolute Value Difference in USD (Millions)'], color=colors)
+for i, value in enumerate(results_df['Absolute Value Difference in USD (Millions)']):
+    axes[0].text(i, value, f"{value:,.2f}", ha='center', va='bottom')
+axes[0].set_xlabel('Forecast Model')
+axes[0].set_ylabel('USD')
+axes[0].tick_params(axis='x', rotation=45)
+
+# Plot Average MAE
+axes[1].bar(results_df['Forecast Model'], results_df['Average MAE'], color=colors)
+for i, value in enumerate(results_df['Average MAE']):
+    axes[1].text(i, value, f"{value:,.2f}", ha='center', va='bottom')
+axes[1].set_xlabel('Forecast Model')
+axes[1].set_ylabel('MAE')
+axes[1].tick_params(axis='x', rotation=45)
+
+# Display the plots
+plt.tight_layout()
+plt.show()
+
+# Define colors for the bars
+colors = ['blue', 'orange', 'green', 'red', 'purple']
+
+# Plot Total Absolute Error in Million USD
+plt.figure(figsize=(10, 8))
+plt.bar(results_df['Forecast Model'], results_df['Absolute Value Difference in USD (Millions)'], color=colors)
+for i, value in enumerate(results_df['Absolute Value Difference in USD (Millions)']):
+    plt.text(i, value, f"{value:,.2f}", ha='center', va='bottom')
+plt.xlabel('Forecast Model')
+plt.ylabel('USD')
+plt.xticks(rotation=25)
+plt.show()
+
+# Plot Average MAE
+plt.figure(figsize=(10, 8))
+plt.bar(results_df['Forecast Model'], results_df['Average MAE'], color=colors)
+for i, value in enumerate(results_df['Average MAE']):
+    plt.text(i, value, f"{value:,.2f}", ha='center', va='bottom')
+plt.xlabel('Forecast Model')
+plt.ylabel('MAE')
+plt.xticks(rotation=25)
 plt.show()
