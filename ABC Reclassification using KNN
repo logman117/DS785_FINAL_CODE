@@ -1,0 +1,267 @@
+import pandas as pd
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+from matplotlib.table import Table
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+
+summarized_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_prophet_cnn_lstm.csv")
+
+# Aggregate data for each ItemNum
+aggregated_data = summarized_results.groupby('ItemNum').agg({
+    'TotalPrediction': 'sum',
+    'PriceUSD_per_unit': 'mean',
+    'CostUSD_per_unit': 'mean'
+}).reset_index()
+
+# Select relevant features
+features = aggregated_data[['TotalPrediction', 'PriceUSD_per_unit', 'CostUSD_per_unit']]
+
+# Function to remove outliers using IQR
+def remove_outliers(df, column):
+    Q1 = df[column].quantile(0.0)
+    Q3 = df[column].quantile(0.99)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    return df[(df[column] >= lower_bound) & (df[column] <= upper_bound)]
+
+# Remove outliers from each feature
+for column in features.columns:
+    features = remove_outliers(features, column)
+
+# Ensure that the features and aggregated_data have the same index after outlier removal
+features = features.dropna()
+aggregated_data = aggregated_data.loc[features.index]
+
+# Normalize the data
+scaler = StandardScaler()
+scaled_features = scaler.fit_transform(features)
+
+# Determine the optimal number of clusters using the Elbow Method with K-Means
+wcss = []
+for i in range(1, 11):
+    kmeans = KMeans(n_clusters=i, init='k-means++', max_iter=300, n_init=10, random_state=42)
+    kmeans.fit(scaled_features)
+    wcss.append(kmeans.inertia_)
+
+plt.figure(figsize=(10, 5))
+plt.plot(range(1, 11), wcss, marker='o')
+#plt.title('Elbow Method')
+plt.xlabel('Number of Clusters')
+plt.ylabel('WCSS')
+plt.show()
+
+# Fit the K-Means model with the optimal number of clusters (e.g., K=3 for ABC classification)
+optimal_clusters = 3  # Adjust based on the elbow plot
+kmeans = KMeans(n_clusters=optimal_clusters, init='k-means++', max_iter=300, n_init=10, random_state=42)
+clusters = kmeans.fit_predict(scaled_features)
+
+# Add cluster labels to the aggregated data
+aggregated_data['Cluster'] = clusters
+
+# Map clusters to ABC classification based on their characteristics
+cluster_mapping = {
+    0: 'C',  # Adjust based on cluster summary
+    1: 'B',
+    2: 'A'
+}
+
+aggregated_data['ABC_Classification'] = aggregated_data['Cluster'].map(cluster_mapping)
+
+# Merge the classification back to the original dataframe
+summarized_results = summarized_results.merge(aggregated_data[['ItemNum', 'ABC_Classification']], on='ItemNum', how='left')
+
+# Rename the classification column to New_ABC
+summarized_results.rename(columns={'ABC_Classification': 'New_ABC'}, inplace=True)
+
+# Assign NaN values in New_ABC to 'A'
+summarized_results['New_ABC'].fillna('A', inplace=True)
+
+# Visualize the classifications
+plt.figure(figsize=(10, 6))
+sns.scatterplot(data=aggregated_data, x='TotalPrediction', y='PriceUSD_per_unit', hue='ABC_Classification', palette='Set1')
+#plt.title('ABC Classification of Parts')
+plt.legend(title='ABC_Classification')
+plt.show()
+
+# Visualize the classifications
+plt.figure(figsize=(10, 6))
+sns.scatterplot(data=aggregated_data, x='TotalPrediction', y='CostUSD_per_unit', hue='ABC_Classification', palette='Set1')
+#plt.title('ABC Classification of Parts')
+plt.legend(title='ABC_Classification')
+plt.show()
+
+# Count the number of NaN, A, B, and C values in the 'New_ABC' column
+value_counts = summarized_results['New_ABC'].value_counts(dropna=False)
+print(value_counts)
+
+# Define final_df
+orders_by_month_1 = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month_1['CustomerRequestedDate'] = pd.to_datetime(orders_by_month_1['CustomerRequestedDate'])
+
+# Filter out rows where ABC is NaN
+filtered_orders = orders_by_month_1.dropna(subset=['ABC'])
+
+# Sort by CustomerRequestedDate in descending order
+sorted_df = filtered_orders.sort_values(by='CustomerRequestedDate', ascending=False)
+
+# Drop duplicates, keeping the most recent date for each ItemNum with a non-null ABC
+latest_orders_with_abc = sorted_df.drop_duplicates(subset='ItemNum', keep='first')
+
+# Get all unique ItemNums
+all_itemnums = orders_by_month_1['ItemNum'].unique()
+
+# Identify ItemNums without an ABC value
+itemnums_without_abc = set(all_itemnums) - set(latest_orders_with_abc['ItemNum'])
+
+# Create DataFrame for ItemNums without ABC and assign 'E'
+missing_abc_df = pd.DataFrame({'ItemNum': list(itemnums_without_abc), 'ABC': 'E'})
+
+# Combine the DataFrames
+final_df = pd.concat([latest_orders_with_abc[['ItemNum', 'CustomerRequestedDate', 'ABC']], missing_abc_df])
+
+# Replace 'E', 'C', 'D', and 'c' with 'C'
+final_df['ABC'] = final_df['ABC'].replace({'E': 'C', 'C': 'C', 'D': 'C', 'c': 'C'})
+
+# Ensure that ItemNum is the key for merging
+final_df = final_df[['ItemNum', 'ABC']]
+
+# Rename the ABC column in final_df to old_ABC
+final_df.rename(columns={'ABC': 'old_ABC'}, inplace=True)
+
+# Merge the old_ABC values into summarized_results
+summarized_results = summarized_results.merge(final_df, on='ItemNum', how='left')
+
+# Calculate revenue_per_ItemNum
+summarized_results['revenue_per_ItemNum'] = summarized_results['TotalActual'] * summarized_results['PriceUSD_per_unit']
+
+# Calculate cost_per_ItemNum
+summarized_results['cost_per_ItemNum'] = summarized_results['TotalActual'] * summarized_results['CostUSD_per_unit']
+
+# Calculate margin_per_ItemNum
+summarized_results['margin_per_ItemNum'] = summarized_results['TotalActual'] * summarized_results['MarginUSD_per_unit']
+
+# Sum up the revenue_per_ItemNum per New_ABC
+revenue_per_New_ABC = summarized_results.groupby('New_ABC')['revenue_per_ItemNum'].sum().reset_index()
+revenue_per_New_ABC.rename(columns={'revenue_per_ItemNum': 'revenue_per_New_ABC'}, inplace=True)
+
+# Sum up the revenue_per_ItemNum per old_ABC
+revenue_per_old_ABC = summarized_results.groupby('old_ABC')['revenue_per_ItemNum'].sum().reset_index()
+revenue_per_old_ABC.rename(columns={'revenue_per_ItemNum': 'revenue_per_old_ABC'}, inplace=True)
+
+# Merge the results for comparison
+revenue_comparison_df = revenue_per_New_ABC.merge(revenue_per_old_ABC, left_on='New_ABC', right_on='old_ABC', how='outer')
+
+# Format the revenue columns as USD
+revenue_comparison_df['revenue_per_New_ABC'] = revenue_comparison_df['revenue_per_New_ABC'].apply(lambda x: f"${x:,.2f}")
+revenue_comparison_df['revenue_per_old_ABC'] = revenue_comparison_df['revenue_per_old_ABC'].apply(lambda x: f"${x:,.2f}")
+
+# Sum up the cost_per_ItemNum per New_ABC
+cost_per_New_ABC = summarized_results.groupby('New_ABC')['cost_per_ItemNum'].sum().reset_index()
+cost_per_New_ABC.rename(columns={'cost_per_ItemNum': 'cost_per_New_ABC'}, inplace=True)
+
+# Sum up the cost_per_ItemNum per old_ABC
+cost_per_old_ABC = summarized_results.groupby('old_ABC')['cost_per_ItemNum'].sum().reset_index()
+cost_per_old_ABC.rename(columns={'cost_per_ItemNum': 'cost_per_old_ABC'}, inplace=True)
+
+# Merge the results for comparison
+cost_comparison_df = cost_per_New_ABC.merge(cost_per_old_ABC, left_on='New_ABC', right_on='old_ABC', how='outer')
+
+# Format the cost columns as USD
+cost_comparison_df['cost_per_New_ABC'] = cost_comparison_df['cost_per_New_ABC'].apply(lambda x: f"${x:,.2f}")
+cost_comparison_df['cost_per_old_ABC'] = cost_comparison_df['cost_per_old_ABC'].apply(lambda x: f"${x:,.2f}")
+
+# Sum up the margin_per_ItemNum per New_ABC
+margin_per_New_ABC = summarized_results.groupby('New_ABC')['margin_per_ItemNum'].sum().reset_index()
+margin_per_New_ABC.rename(columns={'margin_per_ItemNum': 'margin_per_New_ABC'}, inplace=True)
+
+# Sum up the margin_per_ItemNum per old_ABC
+margin_per_old_ABC = summarized_results.groupby('old_ABC')['margin_per_ItemNum'].sum().reset_index()
+margin_per_old_ABC.rename(columns={'margin_per_ItemNum': 'margin_per_old_ABC'}, inplace=True)
+
+# Merge the results for comparison
+margin_comparison_df = margin_per_New_ABC.merge(margin_per_old_ABC, left_on='New_ABC', right_on='old_ABC', how='outer')
+
+# Format the margin columns as USD
+margin_comparison_df['margin_per_New_ABC'] = margin_comparison_df['margin_per_New_ABC'].apply(lambda x: f"${x:,.2f}")
+margin_comparison_df['margin_per_old_ABC'] = margin_comparison_df['margin_per_old_ABC'].apply(lambda x: f"${x:,.2f}")
+
+# Print the dataframes
+print("Revenue per New_ABC:")
+print(revenue_per_New_ABC)
+
+print("\nRevenue per Old_ABC:")
+print(revenue_per_old_ABC)
+
+print("\nComparison of Revenues:")
+print(revenue_comparison_df)
+
+print("\nCost per New_ABC:")
+print(cost_per_New_ABC)
+
+print("\nCost per Old_ABC:")
+print(cost_per_old_ABC)
+
+print("\nComparison of Costs:")
+print(cost_comparison_df)
+
+print("\nMargin per New_ABC:")
+print(margin_per_New_ABC)
+
+print("\nMargin per Old_ABC:")
+print(margin_per_old_ABC)
+
+print("\nComparison of Margins:")
+print(margin_comparison_df)
+
+# Prepare the data for the new plot
+new_data = {
+    "Model Type": ["KNN ABC Model (NEW)", "KNN ABC Model (NEW)", "KNN ABC Model (NEW)", "Old ABC Model", "Old ABC Model", "Old ABC Model"],
+    "ABC Classification": ["A", "B", "C", "A", "B", "C"],
+    "Unique ItemNums": [summarized_results[summarized_results['New_ABC'] == 'A'].nunique()['ItemNum'], 
+                        summarized_results[summarized_results['New_ABC'] == 'B'].nunique()['ItemNum'], 
+                        summarized_results[summarized_results['New_ABC'] == 'C'].nunique()['ItemNum'],
+                        summarized_results[summarized_results['old_ABC'] == 'A'].nunique()['ItemNum'], 
+                        summarized_results[summarized_results['old_ABC'] == 'B'].nunique()['ItemNum'], 
+                        summarized_results[summarized_results['old_ABC'] == 'C'].nunique()['ItemNum']],
+    "Total Revenue": [f"${summarized_results[summarized_results['New_ABC'] == 'A']['revenue_per_ItemNum'].sum():,.2f}", 
+                      f"${summarized_results[summarized_results['New_ABC'] == 'B']['revenue_per_ItemNum'].sum():,.2f}", 
+                      f"${summarized_results[summarized_results['New_ABC'] == 'C']['revenue_per_ItemNum'].sum():,.2f}",
+                      f"${summarized_results[summarized_results['old_ABC'] == 'A']['revenue_per_ItemNum'].sum():,.2f}", 
+                      f"${summarized_results[summarized_results['old_ABC'] == 'B']['revenue_per_ItemNum'].sum():,.2f}", 
+                      f"${summarized_results[summarized_results['old_ABC'] == 'C']['revenue_per_ItemNum'].sum():,.2f}"],
+    "Total Margin": [f"${summarized_results[summarized_results['New_ABC'] == 'A']['margin_per_ItemNum'].sum():,.2f}", 
+                     f"${summarized_results[summarized_results['New_ABC'] == 'B']['margin_per_ItemNum'].sum():,.2f}", 
+                     f"${summarized_results[summarized_results['New_ABC'] == 'C']['margin_per_ItemNum'].sum():,.2f}",
+                     f"${summarized_results[summarized_results['old_ABC'] == 'A']['margin_per_ItemNum'].sum():,.2f}", 
+                     f"${summarized_results[summarized_results['old_ABC'] == 'B']['margin_per_ItemNum'].sum():,.2f}", 
+                     f"${summarized_results[summarized_results['old_ABC'] == 'C']['margin_per_ItemNum'].sum():,.2f}"]
+}
+
+df_new_plot = pd.DataFrame(new_data)
+
+# Create the new performance table plot
+def create_performance_table(df):
+    fig, ax = plt.subplots(figsize=(24, 12))
+    ax.set_axis_off()
+    tbl = Table(ax, bbox=[0, 0, 1, 1])
+
+    n_rows, n_cols = df.shape
+    width, height = 1.0 / n_cols, 1.0 / (n_rows + 1)
+
+    # Add headers
+    for i, column in enumerate(df.columns):
+        cell = tbl.add_cell(0, i, width, height, text=column, loc='center', facecolor='lightgrey')
+        cell.get_text().set_fontsize(18)
+
+    # Add data rows
+    for row in range(n_rows):
+        for col in range(n_cols):
+            cell = tbl.add_cell(row + 1, col, width, height, text=df.iat[row, col], loc='center', facecolor='white')
+            cell.get_text().set_fontsize(22)
+
+    ax.add_table(tbl)
+    plt.show()
+
+create_performance_table(df_new_plot)
