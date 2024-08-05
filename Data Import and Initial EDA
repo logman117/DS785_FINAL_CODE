@@ -1,0 +1,345 @@
+
+import pyodbc
+import pandas as pd
+import datetime
+# Get the current date and time
+today = datetime.datetime.now()
+
+# Format the date and time into a string
+date_string = today.strftime('%Y-%m-%d')
+import time
+from datetime import timedelta
+import datetime
+# import the US holidays from the holidays package
+from pandas.tseries.offsets import CustomBusinessDay
+import holidays
+import numpy as np
+import sys
+from urllib.parse import quote
+from azure.storage.fileshare import ShareClient, ResourceTypes, AccountSasPermissions, generate_account_sas
+from datetime import datetime, timedelta
+import os
+import glob
+
+
+#grab the historic orders
+def dc_connect(driver, server, database, port, trusted_connection='yes'):
+    connection_string = f'DRIVER={{{driver}}};SERVER={server};DATABASE={database};Trusted_Connection={trusted_connection};PORT={port};'
+    con = pyodbc.connect(connection_string)
+    return con
+
+# Define your SQL query
+my_sql = """SELECT f.*,
+       d.ItemDescription,
+       d.CountryOfOrigin,
+       d.FixedLeadTime,
+       c.PurchaseCurrency,
+       c.PurchasePrice,
+       c.ActualCostPrice,
+       c.ActualMaterialCost,
+       c.ActualOperationalCost,
+       c.MinimumOrderQuantity,
+       c.MaximumOrderQuantity,
+       c.SafetyStock,
+       c.SafetyTime,
+       c.SupplyLeadTime,
+       c.ReorderPoint,
+       c.MaximumInventory,
+       c.SafetyStockNotAllowed,
+       c.SupplierID,
+       s.CostUSD,
+       s.MarginUSD,
+       s.PriceUSD,
+       cust.CustomerName -- Adding CustomerName
+FROM [iCube].[dbo].[Fact_SalesLineFulfillmentsE2E] f
+LEFT JOIN (
+    SELECT ItemNum, 
+           MAX(ItemDescription) AS ItemDescription, 
+           MAX(CountryOfOrigin) AS CountryOfOrigin, 
+           MAX(FixedLeadTime) AS FixedLeadTime
+    FROM [iCube].[dbo].[Dim_ItemsGeneral]
+    WHERE DCPlanner <> 'Obsolete Item'
+      AND DCBuyer <> 'Obsolete Item'
+    GROUP BY ItemNum
+) d ON f.ItemNum = d.ItemNum
+LEFT JOIN (
+    SELECT ItemNum, 
+           MAX(PurchaseCurrency) AS PurchaseCurrency, 
+           MAX(PurchasePrice) AS PurchasePrice, 
+           MAX(ActualCostPrice) AS ActualCostPrice, 
+           MAX(ActualMaterialCost) AS ActualMaterialCost, 
+           MAX(ActualOperationalCost) AS ActualOperationalCost,
+           MAX(MinimumOrderQuantity) AS MinimumOrderQuantity, 
+           MAX(MaximumOrderQuantity) AS MaximumOrderQuantity, 
+           MAX(SafetyStock) AS SafetyStock, 
+           MAX(SafetyTime) AS SafetyTime, 
+           MAX(SupplyLeadTime) AS SupplyLeadTime,
+           MAX(ReorderPoint) AS ReorderPoint, 
+           MAX(MaximumInventory) AS MaximumInventory, 
+           MAX(SafetyStockNotAllowed) AS SafetyStockNotAllowed,
+		   MAX(SupplierID) AS SupplierID
+    FROM [iCube].[dbo].[Dim_ItemsCompany]
+    GROUP BY ItemNum
+) c ON f.ItemNum = c.ItemNum
+LEFT JOIN [iCube].[dbo].[Fact_Sales] s
+    ON f.ItemNum = s.ItemNum 
+    AND f.OrderNum = s.OrderNum 
+    AND f.PositionNum = s.PositionNum
+	AND f.ShipmentID = s.ShipmentID
+LEFT JOIN [iCube].[dbo].[dim_Customers2024] cust -- Joining with dim_Customers2024
+    ON f.CustomerNum = cust.CustomerNum -- Assuming Fact_SalesLineFulfillmentsE2E has CustomerNum
+WHERE f.ItemGroup = 'APA'
+  AND f.OrderDateID >= '20220101'
+ORDER BY f.OrderDateID;
+"""
+
+# Connection parameters
+driver = #INTENTIONALLY LEFT BLANK
+server = #INTENTIONALLY LEFT BLANK
+database = #INTENTIONALLY LEFT BLANK
+port = #INTENTIONALLY LEFT BLANK
+
+# Connect to the database and run the query
+con = dc_connect(driver, server, database, port)
+
+# Use pandas to read the query result into a DataFrame
+historic_sales = pd.read_sql_query(my_sql, con)
+
+# Close the connection
+con.close()
+historic_sales = historic_sales.drop(['PickDate', 'HeaderPlannedDeliveryDate', 'RequestedGIDateItemNum', 'PartitionRowNum', 'RequestedGoodsIssueDate', 'RequestedGoodsIssueDateID', 'Route', 'SalesOrderStatusID', 'RouteID', 'N5ID', 'OrderTypeID'], axis=1)
+column_names = historic_sales.columns.tolist()
+
+for column in column_names:
+    print(column)
+
+#historic_sales = historic_sales_copy.copy()
+# Define the order of columns
+columns_order = [
+    'LogisticsCompanyID', 'FinanceCompanyID', 'OrderNum', 'OrderType', 'ItemsCompanyID', 'WarehouseID', 
+    'ItemNum', 'OrderDateID', 'ABC', 'OrderShipConstraint', 'BadOrMissingApprovalDate', 'ApprovalDate', 
+    'ApprovedBefore3PM', 'ApprovedSameDay', 'InventoryStatus', 'WHSWorkHours', 'OrderDate', 'ShipToState', 
+    'QtyOnHand', 'QtyAllocated', 'QtyAvailable', 'QtyOnOrder', 'WarehouseNum', 
+    'OrderQty', 'PlannedDeliveryDateID', 'SupplyChainExpectedDeliveryDate', 'SupplyChainTotalDaysToDeliver', 
+    'DeliveredDate', 'PlannedDeliveryDate', 'CustomerNum', 'PositionNum', 'ItemsGeneralID', 'ShipmentID', 
+    'CarrierLSP', 'ItemGroup', 'SupplyLeadTime', 'ActualLeadTime', 'LeadTime', 'TransitTime', 'OrderStatus', 
+    'SupplyChainDelayReason', 'ShipDate', 'ActualShipDate', 'NewQtyAvailable', 'FinalQtyAvailable', 
+    'Available', 'RequestedGIDelayReason', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'PurchaseCurrency', 
+    'PurchasePrice', 'SafetyStock', 'SafetyTime', 'ReorderPoint', 'ItemDescription', 'CustomerName',
+    'MaximumInventory', 'SafetyStockNotAllowed', 'SupplierID', 'CountryOfOrigin', 'CostUSD', 'MarginUSD', 'PriceUSD'
+]
+
+# Reorder the columns
+historic_sales = historic_sales[columns_order]
+
+historic_sales_copy = historic_sales.copy()
+print(historic_sales_copy.columns)
+
+# Duplicate ItemNum column
+historic_sales['Original_ItemNum'] = historic_sales['ItemNum']
+
+# Create a unique list of most recent ItemNums with all columns
+most_recent_items = historic_sales.sort_values(by='OrderDate', ascending=False).drop_duplicates(subset=['ItemNum'])
+
+# Read the replacement data
+df = pd.read_excel("Alternative Items - Refreshable (1).xlsx", sheet_name="Sheet1")
+
+# Normalize the SignalCode and AltSignalCode columns by stripping whitespace
+df['SignalCode'] = df['SignalCode'].str.strip()
+df['AltSignalCode'] = df['AltSignalCode'].str.strip()
+df['Item'] = df['Item'].str.strip()
+df['AltItem'] = df['AltItem'].str.strip()
+historic_sales['ItemNum'] = historic_sales['ItemNum'].str.strip()
+
+# Step 2: Filter the DataFrame based on the valid SignalCode values
+valid_signal_codes = {'O', 'D', 'C', 'I', 'R', 'PIT', 'PBO', 'PD', 'PW', 'P', 'PR', 'TO', 'PO', 'MR', 'ISI', 'R17', 'ZC'}
+df = df[df['SignalCode'].isin(valid_signal_codes)]
+
+# Step 3: Create a replacement mapping without filtering on AltSignalCode
+replacement_mapping = {
+    row['Item']: row['AltItem']
+    for _, row in df.iterrows()
+}
+
+# Function to apply replacement mapping to an item number
+def replace_item_number(item_num, replacement_mapping):
+    seen_items = set()
+    while item_num in replacement_mapping and item_num not in seen_items:
+        seen_items.add(item_num)
+        item_num = replacement_mapping[item_num]
+    return item_num
+
+# Apply the replacement iteratively until no more changes occur
+def iteratively_replace_item_numbers(data, replacement_mapping):
+    previous_item_numbers = None
+    while previous_item_numbers is None or not previous_item_numbers.equals(data['ItemNum']):
+        previous_item_numbers = data['ItemNum'].copy()
+        data['ItemNum'] = data['ItemNum'].apply(lambda code: replace_item_number(code, replacement_mapping))
+
+# Step 4: Iteratively replace the item numbers in historic_sales
+iteratively_replace_item_numbers(historic_sales, replacement_mapping)
+
+# Step 5: Checker for obsolete items remaining
+obsolete_items_counts = historic_sales['ItemNum'].value_counts()
+obsolete_items_remaining = obsolete_items_counts[obsolete_items_counts.index.isin(df['Item'])]
+
+# If there are any obsolete items remaining, create a DataFrame with them
+if not obsolete_items_remaining.empty:
+    remaining_obsolete_df = pd.DataFrame({
+        'Item': obsolete_items_remaining.index,
+        'Count': obsolete_items_remaining.values
+    })
+    print("Some obsolete items are still present in the ItemNum column:")
+    print(remaining_obsolete_df)
+else:
+    print("All obsolete items have been replaced in the ItemNum column.")
+
+print(historic_sales.columns)
+
+
+mask = historic_sales['OrderShipConstraint'].isin(['Ship Set Complete', 'Ship Order Complete'])
+
+# Then, use the mask to filter the DataFrame and update 'PlannedShipFromDC'
+historic_sales.loc[mask, 'PlannedDeliveryDate'] = historic_sales.loc[mask].groupby('OrderNum')['PlannedDeliveryDate'].transform('max')
+
+historic_sales = historic_sales.rename(columns={"PlannedDeliveryDate": "CustomerRequestedDate"})
+historic_sales.dtypes
+# Calculate the number of days to ship
+historic_sales['NumberOfDaysToShip'] = (historic_sales['ShipDate'] - historic_sales['CustomerRequestedDate']).dt.days
+
+# If ShipDate exceeds CustomerRequestedDate, keep the positive difference
+historic_sales['NumberOfDaysToShip'] = historic_sales['NumberOfDaysToShip'].apply(lambda x: x if x > 0 else 0)
+
+# Ensure dates are in datetime format
+historic_sales['CustomerRequestedDate'] = pd.to_datetime(historic_sales['CustomerRequestedDate'])
+historic_sales['ShipDate'] = pd.to_datetime(historic_sales['ShipDate'])
+
+# Calculate the number of days to ship
+historic_sales['NumberOfDaysToShip'] = (historic_sales['ShipDate'] - historic_sales['CustomerRequestedDate']).dt.days
+
+# Keep only positive differences
+historic_sales['NumberOfDaysToShip'] = historic_sales['NumberOfDaysToShip'].clip(lower=0)
+
+# Calculate the unique values and their counts
+value_counts = historic_sales['NumberOfDaysToShip'].value_counts().sort_index()
+
+# Display the result
+print(value_counts)
+
+import matplotlib.pyplot as plt
+# Calculate the 99.9th percentile cutoff
+cutoff = historic_sales['NumberOfDaysToShip'].quantile(0.999)
+
+# Filter out the worst .1%
+filtered_df = historic_sales[historic_sales['NumberOfDaysToShip'] <= cutoff]
+
+# Calculate the unique values and their counts
+value_counts = filtered_df['NumberOfDaysToShip'].value_counts().sort_index()
+
+# Convert the value counts to a DataFrame
+value_counts_df = value_counts.reset_index()
+value_counts_df.columns = ['NumberOfDaysToShip', 'Count']
+
+# Plot the data
+plt.figure(figsize=(10, 6))
+plt.bar(value_counts_df['NumberOfDaysToShip'], value_counts_df['Count'], color='skyblue')
+plt.xlabel('Number of Days to Ship')
+plt.ylabel('Count')
+plt.title('Distribution of Number of Days to Ship (Filtered)')
+plt.xticks(rotation=45)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Display the plot
+plt.tight_layout()
+plt.show()
+
+
+# Select the desired columns
+selected_columns = [
+    "CustomerRequestedDate", "ItemNum", "OrderQty", "PurchasePrice", 
+    "ShipDate", "NumberOfDaysToShip", "CustomerName", "CustomerNum"
+]
+new_df = historic_sales[selected_columns]
+
+# Ensure 'OrderQty' is not zero to avoid division by zero errors
+historic_sales = historic_sales[historic_sales['OrderQty'] != 0]
+
+# Define a function to perform the calculations for each group
+def calculate_per_unit_and_normalize(group):
+    group['CostUSD_per_unit'] = group['CostUSD'] / group['OrderQty']
+    group['MarginUSD_per_unit'] = group['MarginUSD'] / group['OrderQty']
+    group['PriceUSD_per_unit'] = group['PriceUSD'] / group['OrderQty']
+    
+    max_cost_per_unit = group['CostUSD_per_unit'].max()
+    max_margin_per_unit = group['MarginUSD_per_unit'].max()
+    max_price_per_unit = group['PriceUSD_per_unit'].max()
+    
+    
+    return group
+
+# Apply the function to each group
+historic_sales = historic_sales.groupby('ItemNum').apply(calculate_per_unit_and_normalize)
+
+# Reset index if needed
+historic_sales.reset_index(drop=True, inplace=True)
+
+columns_to_keep = [
+    'ItemNum', 'CostUSD', 'MarginUSD', 'PriceUSD', 'OrderQty', 
+    'CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit'
+]
+
+# Create a new DataFrame with only the selected columns
+historic_sales_test = historic_sales[columns_to_keep].copy()
+
+# Display the new DataFrame
+historic_sales_test.head()
+
+# Final DataFrame
+###########################
+
+# Ensure 'CustomerRequestedDate' is part of the DataFrame and in datetime format
+historic_sales['CustomerRequestedDate'] = pd.to_datetime(historic_sales['CustomerRequestedDate'])
+historic_sales.set_index('CustomerRequestedDate', inplace=True)
+
+# Define columns to sum and average
+sum_columns = ['OrderQty', 'PurchasePrice', 'CostUSD', 'MarginUSD', 'PriceUSD']
+avg_columns = ['NumberOfDaysToShip', 'ActualLeadTime', 'LeadTime', 'TransitTime', 
+               'QtyOnHand', 'QtyOnOrder', 'FinalQtyAvailable', 'CostUSD_per_unit', 'MarginUSD_per_unit', 
+               'PriceUSD_per_unit', ]
+
+# Group by month and aggregate the required columns
+orders_by_month = historic_sales.groupby([pd.Grouper(freq='MS'), 'ItemNum']).agg({
+    **{col: 'sum' for col in sum_columns}, 
+    **{col: 'mean' for col in avg_columns}
+}).reset_index()
+
+# Generate a complete date range
+all_months = pd.date_range(start=orders_by_month['CustomerRequestedDate'].min(), 
+                           end=orders_by_month['CustomerRequestedDate'].max(), 
+                           freq='MS')
+
+# Generate a complete index of all (month, ItemNum) pairs
+all_index = pd.MultiIndex.from_product([all_months, orders_by_month['ItemNum'].unique()], 
+                                       names=['CustomerRequestedDate', 'ItemNum'])
+
+# Reindex the DataFrame to include all (month, ItemNum) pairs
+orders_by_month = orders_by_month.set_index(['CustomerRequestedDate', 'ItemNum']).reindex(all_index).reset_index()
+
+# Fill missing values with zeros or appropriate default values
+orders_by_month[sum_columns] = orders_by_month[sum_columns].fillna(0)
+orders_by_month[avg_columns] = orders_by_month[avg_columns].fillna(0)
+
+# Add columns that should be just included
+include_columns = ['ABC', 'SupplierID', 'CountryOfOrigin', 'SafetyStock', 'SafetyTime', 'ReorderPoint', 
+                   'MaximumInventory', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SafetyStockNotAllowed', 'ItemGroup']
+
+# We will use the most frequent value (mode) for the included columns for each month and ItemNum
+mode_df = historic_sales.groupby([pd.Grouper(freq='MS'), 'ItemNum'])[include_columns].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]).reset_index()
+
+# Merge the mode columns back into the orders_by_month DataFrame
+orders_by_month = pd.merge(orders_by_month, mode_df, on=['CustomerRequestedDate', 'ItemNum'], how='left')
+
+orders_by_month = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-06-30']
+
+# Save to CSV for reference
+orders_by_month.to_csv("orders_by_month_1.csv", index=False)
