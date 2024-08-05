@@ -1,0 +1,1164 @@
+##########CNN LSTM ONLY
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, LSTM, Dense, Flatten, Dropout, TimeDistributed, InputLayer
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.metrics import mean_absolute_error
+
+# Load and preprocess data
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month['CustomerRequestedDate'] = pd.to_datetime(orders_by_month['CustomerRequestedDate'])
+orders_by_month_reduced = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-02-01']
+monthly_data = orders_by_month_reduced.groupby(['CustomerRequestedDate', 'ItemNum']).sum().reset_index()
+pivot_data = monthly_data.pivot(index='CustomerRequestedDate', columns='ItemNum', values='OrderQty').fillna(0)
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(pivot_data)
+
+# Create sequences for CNN-LSTM model
+def create_sequences(data, seq_length):
+    sequences = []
+    targets = []
+    for i in range(len(data) - seq_length):
+        sequences.append(data[i:i + seq_length])
+        targets.append(data[i + seq_length])
+    return np.array(sequences), np.array(targets)
+
+seq_length = 12
+X, y = create_sequences(scaled_data, seq_length)
+X = X.reshape((X.shape[0], X.shape[1], X.shape[2], 1))
+
+# CNN-LSTM Model Training and Prediction
+tscv = TimeSeriesSplit(n_splits=5)
+cnn_lstm_predictions = []
+
+for train_index, test_index in tscv.split(X):
+    X_train, X_test = X[train_index], X[test_index]
+    y_train, y_test = y[train_index], y[test_index]
+    
+    model = Sequential()
+    model.add(InputLayer(shape=(X_train.shape[1], X_train.shape[2], 1)))
+    model.add(TimeDistributed(Conv1D(filters=32, kernel_size=3, activation='relu')))
+    model.add(TimeDistributed(MaxPooling1D(pool_size=2)))
+    model.add(TimeDistributed(Flatten()))
+    model.add(LSTM(50, activation='relu'))
+    model.add(Dropout(0.2))
+    model.add(Dense(X_train.shape[2]))
+    model.compile(optimizer='adam', loss='mae')
+    
+    early_stopping = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=10, min_lr=1e-9)
+    history = model.fit(X_train, y_train, epochs=100, batch_size=16, validation_split=0.2, verbose=2, callbacks=[early_stopping, reduce_lr])
+    
+    def rolling_predict(model, initial_sequence, n_steps):
+        predictions = []
+        current_sequence = initial_sequence
+        for _ in range(n_steps):
+            prediction = model.predict(current_sequence.reshape(1, current_sequence.shape[0], current_sequence.shape[1], 1))
+            predictions.append(prediction.flatten())
+            current_sequence = np.concatenate([current_sequence[1:], prediction.reshape(1, -1, 1)], axis=0)
+        return np.array(predictions)
+    
+    n_steps_ahead = 4
+    initial_sequence = X_test[-1]  # Starting sequence for predictions
+    rolling_predictions = rolling_predict(model, initial_sequence, n_steps_ahead)
+    rolling_predictions_inverse = scaler.inverse_transform(rolling_predictions)
+    cnn_lstm_predictions.append(rolling_predictions_inverse)
+
+cnn_lstm_predictions = np.mean(cnn_lstm_predictions, axis=0)
+
+# Combine Results into Final DataFrame
+final_results = []
+
+for i in range(cnn_lstm_predictions.shape[0]):
+    final_results.extend([{
+        'ItemNum': pivot_data.columns[j],
+        'Month': pd.date_range(start='2024-02-01', periods=4, freq='MS')[i],
+        'Prediction': cnn_lstm_predictions[i, j],
+    } for j in range(cnn_lstm_predictions.shape[1])])
+
+final_results_df = pd.DataFrame(final_results)
+
+# Add QtyOnHand for February 2024
+qty_on_hand_feb = orders_by_month[(orders_by_month['CustomerRequestedDate'] == '2024-02-01')][['ItemNum', 'QtyOnHand']].drop_duplicates()
+final_results_df = final_results_df.merge(qty_on_hand_feb, on='ItemNum', how='left')
+
+# Add most recent values for additional columns
+columns_to_include = ['CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'ActualLeadTime', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SupplierID', 'CountryOfOrigin']
+most_recent_values = orders_by_month.sort_values(by='CustomerRequestedDate').groupby('ItemNum').tail(1)[['ItemNum'] + columns_to_include]
+
+final_results_df = final_results_df.merge(most_recent_values, on='ItemNum', how='left')
+
+# Prepare the actuals data for the months we are predicting (February to May 2024)
+actuals_data = orders_by_month[(orders_by_month['CustomerRequestedDate'] >= '2024-02-01') & 
+                               (orders_by_month['CustomerRequestedDate'] < '2024-06-01')]
+
+# Calculate total actuals for each item by month
+actuals_total = actuals_data.groupby(['ItemNum', actuals_data['CustomerRequestedDate'].dt.to_period('M')])['OrderQty'].sum().reset_index()
+actuals_total.columns = ['ItemNum', 'Month', 'ActualOrderQty']
+
+# Ensure the 'Month' column is in datetime format
+actuals_total['Month'] = actuals_total['Month'].dt.to_timestamp()
+
+# Merge actual order quantities with the predictions
+final_results_df['Month'] = pd.to_datetime(final_results_df['Month'])
+final_results_df = final_results_df.merge(actuals_total, on=['ItemNum', 'Month'], how='left')
+
+# Recalculate MAE including actual order quantities
+final_results_df['MAE'] = final_results_df.apply(lambda row: mean_absolute_error([row['ActualOrderQty']], [row['Prediction']]), axis=1)
+
+final_results_df_CNN_LSTM_ONLY = final_results_df.copy()
+
+# Save the monthly results to CSV
+final_results_df_CNN_LSTM_ONLY.to_csv("FINAL_RESULTS_COMPARISON_MONTHLY_CNN_LSTM_ONLY.csv", index=False)
+
+print(f"Final Results (Monthly):\n{final_results_df.head()}")
+
+# Calculate total actuals for each item
+actuals_total_sum = actuals_data.groupby('ItemNum')['OrderQty'].sum().reset_index()
+actuals_total_sum.columns = ['ItemNum', 'TotalActual']
+
+# Calculate total predictions for each item
+total_predictions_sum = final_results_df.groupby('ItemNum')['Prediction'].sum().reset_index()
+total_predictions_sum.columns = ['ItemNum', 'TotalPrediction']
+
+# Merge total actuals and total predictions into the summarized results
+summarized_results = actuals_total_sum.merge(total_predictions_sum, on='ItemNum', how='left')
+
+# Calculate MAE for each item
+summarized_results['MAE'] = summarized_results.apply(lambda row: mean_absolute_error([row['TotalActual']], [row['TotalPrediction']]), axis=1)
+
+# Include additional columns from most recent values
+summarized_results_CNN_LSTM_ONLY = summarized_results.merge(most_recent_values, on='ItemNum', how='left')
+
+# Save the summarized final results to CSV
+summarized_results_CNN_LSTM_ONLY.to_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_CNN_LSTM_ONLY.csv", index=False)
+
+print(f"Final Summarized Results:\n{summarized_results.head()}")
+
+######################### HISTORIC MOVING AVERAGE (CURRENT MODEL)######################################
+
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_absolute_error
+
+# Load and preprocess data
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month['CustomerRequestedDate'] = pd.to_datetime(orders_by_month['CustomerRequestedDate'])
+orders_by_month_reduced = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-02-01']
+
+# Function to calculate historical moving average
+def historical_moving_average(item_num, data, target_month):
+    month_data = data[(data['ItemNum'] == item_num) & (data['CustomerRequestedDate'].dt.month == target_month.month)]
+    return month_data['OrderQty'].mean()
+
+# Create predictions using the historical moving average
+def create_historical_moving_avg_predictions(data):
+    final_results = []
+    prediction_months = pd.date_range(start='2024-02-01', periods=4, freq='MS')
+    
+    for item_num in data['ItemNum'].unique():
+        for month in prediction_months:
+            avg_prediction = historical_moving_average(item_num, data, month)
+            final_results.append({
+                'ItemNum': item_num,
+                'Month': month,
+                'Prediction': avg_prediction
+            })
+    
+    return pd.DataFrame(final_results)
+
+final_results_df = create_historical_moving_avg_predictions(orders_by_month_reduced)
+
+# Add QtyOnHand for February 2024
+qty_on_hand_feb = orders_by_month[(orders_by_month['CustomerRequestedDate'] == '2024-02-01')][['ItemNum', 'QtyOnHand']].drop_duplicates()
+final_results_df = final_results_df.merge(qty_on_hand_feb, on='ItemNum', how='left')
+
+# Add most recent values for additional columns
+columns_to_include = ['CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'ActualLeadTime', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SupplierID', 'CountryOfOrigin']
+most_recent_values = orders_by_month.sort_values(by='CustomerRequestedDate').groupby('ItemNum').tail(1)[['ItemNum'] + columns_to_include]
+
+final_results_df = final_results_df.merge(most_recent_values, on='ItemNum', how='left')
+
+# Prepare the actuals data for the months we are predicting (February to May 2024)
+actuals_data = orders_by_month[(orders_by_month['CustomerRequestedDate'] >= '2024-02-01') & 
+                               (orders_by_month['CustomerRequestedDate'] < '2024-06-01')]
+
+# Calculate total actuals for each item by month
+actuals_total = actuals_data.groupby(['ItemNum', actuals_data['CustomerRequestedDate'].dt.to_period('M')])['OrderQty'].sum().reset_index()
+actuals_total.columns = ['ItemNum', 'Month', 'ActualOrderQty']
+
+# Ensure the 'Month' column is in datetime format
+actuals_total['Month'] = actuals_total['Month'].dt.to_timestamp()
+
+# Merge actual order quantities with the predictions
+final_results_df['Month'] = pd.to_datetime(final_results_df['Month'])
+final_results_df = final_results_df.merge(actuals_total, on=['ItemNum', 'Month'], how='left')
+
+# Recalculate MAE including actual order quantities
+final_results_df['MAE'] = final_results_df.apply(lambda row: mean_absolute_error([row['ActualOrderQty']], [row['Prediction']]), axis=1)
+
+final_results_df_HISTORIC_MOVING_AVERAGE = final_results_df.copy()
+
+# Save the monthly results to CSV
+final_results_df.to_csv("FINAL_RESULTS_COMPARISON_MONTHLY_HISTORIC_MOVING_AVERAGE.csv", index=False)
+
+print(f"Final Results (Monthly):\n{final_results_df.head()}")
+
+# Calculate total actuals for each item
+actuals_total_sum = actuals_data.groupby('ItemNum')['OrderQty'].sum().reset_index()
+actuals_total_sum.columns = ['ItemNum', 'TotalActual']
+
+# Calculate total predictions for each item
+total_predictions_sum = final_results_df.groupby('ItemNum')['Prediction'].sum().reset_index()
+total_predictions_sum.columns = ['ItemNum', 'TotalPrediction']
+
+# Merge total actuals and total predictions into the summarized results
+summarized_results = actuals_total_sum.merge(total_predictions_sum, on='ItemNum', how='left')
+
+# Calculate MAE for each item
+summarized_results['MAE'] = summarized_results.apply(lambda row: mean_absolute_error([row['TotalActual']], [row['TotalPrediction']]), axis=1)
+
+# Include additional columns from most recent values
+summarized_results__HISTORIC_MOVING_AVERAGE = summarized_results.merge(most_recent_values, on='ItemNum', how='left')
+
+# Save the summarized final results to CSV
+summarized_results__HISTORIC_MOVING_AVERAGE.to_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_HISTORIC_MOVING_AVERAGE.csv", index=False)
+
+print(f"Final Summarized Results:\n{summarized_results.head()}")
+
+
+###########################LINEAR EXPONENTIAN SMOOTHING#######################
+
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.metrics import mean_absolute_error
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit
+from tqdm import tqdm
+from joblib import Parallel, delayed
+
+
+# Load and preprocess data
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month['CustomerRequestedDate'] = pd.to_datetime(orders_by_month['CustomerRequestedDate'])
+orders_by_month_reduced = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-02-01']
+
+# Function to predict using Linear Exponential Smoothing
+def predict_with_les(item_num, data):
+    item_data = data[data['ItemNum'] == item_num].set_index('CustomerRequestedDate')['OrderQty'].asfreq('MS').dropna()
+
+    if len(item_data) < 2:  # Not enough data to fit the model
+        return None
+
+    try:
+        model = ExponentialSmoothing(item_data, trend='add', seasonal=None, initialization_method='estimated')
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=4)
+        return forecast.values
+    except Exception as e:
+        return None
+
+# Predict for all items using LES
+les_predictions = Parallel(n_jobs=-1)(
+    delayed(predict_with_les)(item_num, orders_by_month_reduced)
+    for item_num in tqdm(orders_by_month_reduced['ItemNum'].unique())
+)
+
+# Combine LES results into final DataFrame
+final_results = []
+
+prediction_months = pd.date_range(start='2024-02-01', periods=4, freq='MS')
+
+for item_num, predictions in zip(orders_by_month_reduced['ItemNum'].unique(), les_predictions):
+    if predictions is not None:
+        final_results.extend([{
+            'ItemNum': item_num,
+            'Month': prediction_months[i],
+            'Prediction': predictions[i]
+        } for i in range(len(predictions))])
+
+final_results_df = pd.DataFrame(final_results)
+
+# Add QtyOnHand for February 2024
+qty_on_hand_feb = orders_by_month[(orders_by_month['CustomerRequestedDate'] == '2024-02-01')][['ItemNum', 'QtyOnHand']].drop_duplicates()
+final_results_df = final_results_df.merge(qty_on_hand_feb, on='ItemNum', how='left')
+
+# Add most recent values for additional columns
+columns_to_include = ['CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'ActualLeadTime', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SupplierID', 'CountryOfOrigin']
+most_recent_values = orders_by_month.sort_values(by='CustomerRequestedDate').groupby('ItemNum').tail(1)[['ItemNum'] + columns_to_include]
+
+final_results_df = final_results_df.merge(most_recent_values, on='ItemNum', how='left')
+
+# Prepare the actuals data for the months we are predicting (February to May 2024)
+actuals_data = orders_by_month[(orders_by_month['CustomerRequestedDate'] >= '2024-02-01') & 
+                               (orders_by_month['CustomerRequestedDate'] < '2024-06-01')]
+
+# Calculate total actuals for each item by month
+actuals_total = actuals_data.groupby(['ItemNum', actuals_data['CustomerRequestedDate'].dt.to_period('M')])['OrderQty'].sum().reset_index()
+actuals_total.columns = ['ItemNum', 'Month', 'ActualOrderQty']
+
+# Ensure the 'Month' column is in datetime format
+actuals_total['Month'] = actuals_total['Month'].dt.to_timestamp()
+
+# Merge actual order quantities with the predictions
+final_results_df['Month'] = pd.to_datetime(final_results_df['Month'])
+final_results_df = final_results_df.merge(actuals_total, on=['ItemNum', 'Month'], how='left')
+
+# Recalculate MAE including actual order quantities
+final_results_df['MAE'] = final_results_df.apply(lambda row: mean_absolute_error([row['ActualOrderQty']], [row['Prediction']]), axis=1)
+
+final_results_df_LES = final_results_df.copy()
+
+# Save the monthly results to CSV
+final_results_df_LES.to_csv("FINAL_RESULTS_COMPARISON_MONTHLY_LES.csv", index=False)
+
+print(f"Final Results (Monthly):\n{final_results_df.head()}")
+
+# Calculate total actuals for each item
+actuals_total_sum = actuals_data.groupby('ItemNum')['OrderQty'].sum().reset_index()
+actuals_total_sum.columns = ['ItemNum', 'TotalActual']
+
+# Calculate total predictions for each item
+total_predictions_sum = final_results_df.groupby('ItemNum')['Prediction'].sum().reset_index()
+total_predictions_sum.columns = ['ItemNum', 'TotalPrediction']
+
+# Merge total actuals and total predictions into the summarized results
+summarized_results = actuals_total_sum.merge(total_predictions_sum, on='ItemNum', how='left')
+
+# Calculate MAE for each item
+summarized_results['MAE'] = summarized_results.apply(lambda row: mean_absolute_error([row['TotalActual']], [row['TotalPrediction']]), axis=1)
+
+# Include additional columns from most recent values
+summarized_results_LES = summarized_results.merge(most_recent_values, on='ItemNum', how='left')
+
+# Save the summarized final results to CSV
+summarized_results_LES.to_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_LES.csv", index=False)
+
+print(f"Final Summarized Results:\n{summarized_results.head()}")
+
+####Light GBM
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from lightgbm import LGBMRegressor
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+# Load and preprocess data
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month['CustomerRequestedDate'] = pd.to_datetime(orders_by_month['CustomerRequestedDate'])
+orders_by_month_reduced = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-02-01']
+monthly_data = orders_by_month_reduced.groupby(['CustomerRequestedDate', 'ItemNum']).sum().reset_index()
+
+# Feature engineering
+def create_features(df):
+    df['month'] = df['CustomerRequestedDate'].dt.month
+    df['year'] = df['CustomerRequestedDate'].dt.year
+    df['lag1'] = df.groupby('ItemNum')['OrderQty'].shift(1)
+    df['lag2'] = df.groupby('ItemNum')['OrderQty'].shift(2)
+    df['lag3'] = df.groupby('ItemNum')['OrderQty'].shift(3)
+    df['rolling_mean_3'] = df.groupby('ItemNum')['OrderQty'].transform(lambda x: x.shift(1).rolling(3).mean())
+    df.dropna(inplace=True)
+    return df
+
+monthly_data = create_features(monthly_data)
+
+# K-Fold Cross-Validation
+def kfold_cv_lgbm(item_num, df, n_splits=5):
+    df_item = df[df['ItemNum'] == item_num]
+    
+    X = df_item[['month', 'year', 'lag1', 'lag2', 'lag3', 'rolling_mean_3']]
+    y = df_item['OrderQty']
+    
+    kf = KFold(n_splits=n_splits)
+    predictions = np.zeros(len(y))
+    
+    for train_index, test_index in kf.split(X):
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+        
+        model = LGBMRegressor()
+        model.fit(X_train, y_train)
+        
+        predictions[test_index] = model.predict(X_test)
+    
+    return predictions[-n_splits:]
+
+# Generate predictions for all items using K-Fold Cross-Validation
+lgbm_predictions = Parallel(n_jobs=-1)(
+    delayed(kfold_cv_lgbm)(item_num, monthly_data)
+    for item_num in tqdm(monthly_data['ItemNum'].unique())
+)
+
+# Combine LightGBM results into final DataFrame
+final_results = []
+
+prediction_months = pd.date_range(start='2024-02-01', periods=4, freq='MS')
+
+for item_num, predictions in zip(monthly_data['ItemNum'].unique(), lgbm_predictions):
+    if predictions is not None:
+        final_results.extend([{
+            'ItemNum': item_num,
+            'Month': prediction_months[i],
+            'Prediction': predictions[i]
+        } for i in range(len(predictions))])
+
+final_results_df = pd.DataFrame(final_results)
+
+# Add QtyOnHand for February 2024
+qty_on_hand_feb = orders_by_month[(orders_by_month['CustomerRequestedDate'] == '2024-02-01')][['ItemNum', 'QtyOnHand']].drop_duplicates()
+final_results_df = final_results_df.merge(qty_on_hand_feb, on='ItemNum', how='left')
+
+# Add most recent values for additional columns
+columns_to_include = ['CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'ActualLeadTime', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SupplierID', 'CountryOfOrigin']
+most_recent_values = orders_by_month.sort_values(by='CustomerRequestedDate').groupby('ItemNum').tail(1)[['ItemNum'] + columns_to_include]
+
+final_results_df = final_results_df.merge(most_recent_values, on='ItemNum', how='left')
+
+# Prepare the actuals data for the months we are predicting (February to May 2024)
+actuals_data = orders_by_month[(orders_by_month['CustomerRequestedDate'] >= '2024-02-01') & 
+                               (orders_by_month['CustomerRequestedDate'] < '2024-06-01')]
+
+# Calculate total actuals for each item by month
+actuals_total = actuals_data.groupby(['ItemNum', actuals_data['CustomerRequestedDate'].dt.to_period('M')])['OrderQty'].sum().reset_index()
+actuals_total.columns = ['ItemNum', 'Month', 'ActualOrderQty']
+
+# Ensure the 'Month' column is in datetime format
+actuals_total['Month'] = actuals_total['Month'].dt.to_timestamp()
+
+# Merge actual order quantities with the predictions
+final_results_df['Month'] = pd.to_datetime(final_results_df['Month'])
+final_results_df = final_results_df.merge(actuals_total, on=['ItemNum', 'Month'], how='left')
+
+# Recalculate MAE including actual order quantities
+final_results_df['MAE'] = final_results_df.apply(lambda row: mean_absolute_error([row['ActualOrderQty']], [row['Prediction']]), axis=1)
+
+final_results_df_lgbm = final_results_df.copy()
+
+# Save the monthly results to CSV
+final_results_df_lgbm.to_csv("FINAL_RESULTS_COMPARISON_MONTHLY_LGBM.csv", index=False)
+
+print(f"Final Results (Monthly):\n{final_results_df.head()}")
+
+# Calculate total actuals for each item
+actuals_total_sum = actuals_data.groupby('ItemNum')['OrderQty'].sum().reset_index()
+actuals_total_sum.columns = ['ItemNum', 'TotalActual']
+
+# Calculate total predictions for each item
+total_predictions_sum = final_results_df.groupby('ItemNum')['Prediction'].sum().reset_index()
+total_predictions_sum.columns = ['ItemNum', 'TotalPrediction']
+
+# Merge total actuals and total predictions into the summarized results
+summarized_results = actuals_total_sum.merge(total_predictions_sum, on='ItemNum', how='left')
+
+# Calculate MAE for each item
+summarized_results['MAE'] = summarized_results.apply(lambda row: mean_absolute_error([row['TotalActual']], [row['TotalPrediction']]), axis=1)
+
+# Include additional columns from most recent values
+summarized_results_lgbm = summarized_results.merge(most_recent_values, on='ItemNum', how='left')
+
+# Save the summarized final results to CSV
+summarized_results_lgbm.to_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_LGBM.csv", index=False)
+
+print(f"Final Summarized Results:\n{summarized_results.head()}")
+
+
+#######################CNN LSTM/PROPHET MODEL
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, LSTM, Dense, Flatten, Dropout, TimeDistributed, InputLayer
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from statsmodels.tsa.seasonal import STL
+from tqdm import tqdm
+from joblib import Parallel, delayed
+from prophet import Prophet
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# Load and preprocess data
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month['CustomerRequestedDate'] = pd.to_datetime(orders_by_month['CustomerRequestedDate'])
+orders_by_month_reduced = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-02-01']
+monthly_data = orders_by_month_reduced.groupby(['CustomerRequestedDate', 'ItemNum']).sum().reset_index()
+pivot_data = monthly_data.pivot(index='CustomerRequestedDate', columns='ItemNum', values='OrderQty').fillna(0)
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(pivot_data)
+
+# Create sequences for CNN-LSTM model
+def create_sequences(data, seq_length):
+    sequences = []
+    targets = []
+    for i in range(len(data) - seq_length):
+        sequences.append(data[i:i + seq_length])
+        targets.append(data[i + seq_length])
+    return np.array(sequences), np.array(targets)
+
+seq_length = 12
+X, y = create_sequences(scaled_data, seq_length)
+X = X.reshape((X.shape[0], X.shape[1], X.shape[2], 1))
+
+# CNN-LSTM Model Training and Prediction
+tscv = TimeSeriesSplit(n_splits=5)
+cnn_lstm_predictions = []
+
+for train_index, test_index in tscv.split(X):
+    X_train, X_test = X[train_index], X[test_index]
+    y_train, y_test = y[train_index], y[test_index]
+    
+    model = Sequential()
+    model.add(InputLayer(shape=(X_train.shape[1], X_train.shape[2], 1)))
+    model.add(TimeDistributed(Conv1D(filters=32, kernel_size=3, activation='relu')))
+    model.add(TimeDistributed(MaxPooling1D(pool_size=2)))
+    model.add(TimeDistributed(Flatten()))
+    model.add(LSTM(50, activation='relu'))
+    model.add(Dropout(0.2))
+    model.add(Dense(X_train.shape[2]))
+    model.compile(optimizer='adam', loss='mae')
+    
+    early_stopping = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=10, min_lr=1e-9)
+    history = model.fit(X_train, y_train, epochs=100, batch_size=16, validation_split=0.2, verbose=2, callbacks=[early_stopping, reduce_lr])
+    
+    def rolling_predict(model, initial_sequence, n_steps):
+        predictions = []
+        current_sequence = initial_sequence
+        for _ in range(n_steps):
+            prediction = model.predict(current_sequence.reshape(1, current_sequence.shape[0], current_sequence.shape[1], 1))
+            predictions.append(prediction.flatten())
+            current_sequence = np.concatenate([current_sequence[1:], prediction.reshape(1, -1, 1)], axis=0)
+        return np.array(predictions)
+    
+    n_steps_ahead = 4
+    initial_sequence = X_test[-1]  # Starting sequence for predictions
+    rolling_predictions = rolling_predict(model, initial_sequence, n_steps_ahead)
+    rolling_predictions_inverse = scaler.inverse_transform(rolling_predictions)
+    cnn_lstm_predictions.append(rolling_predictions_inverse)
+
+cnn_lstm_predictions = np.mean(cnn_lstm_predictions, axis=0)
+
+# Prophet Model Training and Prediction
+orders_by_month_sampled = orders_by_month_reduced
+seasonal_items = []
+non_seasonal_items = []
+
+def check_seasonality_stl(item_data, threshold=5):
+    item_data = item_data.set_index('CustomerRequestedDate')['OrderQty']
+    item_data = item_data.asfreq('MS').dropna()
+    stl = STL(item_data)
+    result = stl.fit()
+    seasonal_strength = result.seasonal.std() / result.trend.std()
+    return seasonal_strength > threshold
+
+def process_item(item_num, func, threshold):
+    item_data = orders_by_month_sampled[orders_by_month_sampled['ItemNum'] == item_num]
+    try:
+        if func(item_data, threshold=threshold):
+            return item_num, True
+        else:
+            return item_num, False
+    except Exception as e:
+        return item_num, False
+
+processed_items = Parallel(n_jobs=-1)(delayed(process_item)(item_num, check_seasonality_stl, 5) for item_num in tqdm(orders_by_month_sampled['ItemNum'].unique()))
+for item_num, is_seasonal in processed_items:
+    if is_seasonal:
+        seasonal_items.append(item_num)
+    else:
+        non_seasonal_items.append(item_num)
+
+def handle_spikes_mad(df, threshold=6):
+    median_qty = df['OrderQty'].median()
+    mad_qty = np.median(np.abs(df['OrderQty'] - median_qty))
+    spike_threshold_upper = median_qty + threshold * mad_qty
+    spike_threshold_lower = median_qty - threshold * mad_qty
+    spikes_removed = df[(df['OrderQty'] > spike_threshold_upper) | (df['OrderQty'] < spike_threshold_lower)]
+    
+    df['OrderQty_cleaned'] = np.where((df['OrderQty'] > spike_threshold_upper) | (df['OrderQty'] < spike_threshold_lower), median_qty, df['OrderQty'])
+    return df[['CustomerRequestedDate', 'ItemNum', 'OrderQty_cleaned']], spikes_removed[['CustomerRequestedDate', 'ItemNum', 'OrderQty']]
+
+def process_spikes(item_num):
+    item_data = orders_by_month_sampled[orders_by_month_sampled['ItemNum'] == item_num].copy()
+    cleaned_data, spikes_removed = handle_spikes_mad(item_data)
+    return cleaned_data, spikes_removed
+
+results = Parallel(n_jobs=-1)(delayed(process_spikes)(item_num) for item_num in tqdm(non_seasonal_items))
+non_seasonal_cleaned_mad = pd.concat([res[0] for res in results])
+spikes_info_mad = pd.concat([res[1] for res in results])
+
+orders_by_month_cleaned = pd.concat([orders_by_month_sampled[orders_by_month_sampled['ItemNum'].isin(seasonal_items)], non_seasonal_cleaned_mad])
+orders_by_month_cleaned['OrderQty'] = np.where(orders_by_month_cleaned['OrderQty_cleaned'].isna(), orders_by_month_cleaned['OrderQty'], orders_by_month_cleaned['OrderQty_cleaned'])
+orders_by_month_cleaned.drop(columns=['OrderQty_cleaned'], inplace=True)
+
+def predict_with_prophet(item_num, data):
+    item_data = data[data['ItemNum'] == item_num][['CustomerRequestedDate', 'OrderQty']]
+    item_data.columns = ['ds', 'y']
+    
+    tscv = TimeSeriesSplit(n_splits=5)
+    best_mae = float('inf')
+    best_predictions = None
+    
+    if len(item_data) < 6:
+        return None
+    
+    for train_index, test_index in tscv.split(item_data):
+        train_data = item_data.iloc[train_index]
+        test_data = item_data.iloc[test_index]
+        
+        if len(test_data) == 0:
+            continue
+        
+        try:
+            model = Prophet()
+            model.fit(train_data)
+            future = model.make_future_dataframe(periods=len(test_data), freq='MS')
+            forecast = model.predict(future)
+            
+            y_true = test_data['y'].values
+            y_pred = forecast.loc[forecast['ds'].isin(test_data['ds']), 'yhat'].values
+            
+            if len(y_true) != len(y_pred):
+                continue
+            
+            mae = mean_absolute_error(y_true, y_pred)
+            
+            if mae < best_mae:
+                best_mae = mae
+                best_predictions = y_pred
+        
+        except Exception as e:
+            continue
+    
+    return best_predictions
+
+def evaluate_predictive_power(item_num, data):
+    predictions = predict_with_prophet(item_num, data)
+    return predictions
+
+prophet_predictions = Parallel(n_jobs=-1)(delayed(evaluate_predictive_power)(item_num, orders_by_month_cleaned) for item_num in tqdm(orders_by_month_cleaned['ItemNum'].unique()))
+
+prophet_predictions_dict = {item_num: pred for item_num, pred in zip(orders_by_month_cleaned['ItemNum'].unique(), prophet_predictions)}
+
+# Combine Results and Select Best Predictions
+final_results = []
+
+for item_num in orders_by_month_cleaned['ItemNum'].unique():
+    cnn_lstm_pred = cnn_lstm_predictions[:, list(pivot_data.columns).index(item_num)]
+    prophet_pred = prophet_predictions_dict[item_num]
+    
+    if prophet_pred is None:
+        best_pred = cnn_lstm_pred
+    else:
+        cnn_lstm_mae = mean_absolute_error(cnn_lstm_pred, prophet_pred)
+        prophet_mae = mean_absolute_error(prophet_pred, prophet_pred)
+        
+        if cnn_lstm_mae < prophet_mae:
+            best_pred = cnn_lstm_pred
+        else:
+            best_pred = prophet_pred
+    
+    final_results.extend([{
+        'ItemNum': item_num,
+        'Month': pd.date_range(start='2024-02-01', periods=4, freq='MS')[i],
+        'Prediction': best_pred[i],
+    } for i in range(4)])
+
+final_results_df = pd.DataFrame(final_results)
+
+final_results_df_copy = final_results_df.copy()
+
+# Add QtyOnHand for February 2024
+qty_on_hand_feb = orders_by_month[(orders_by_month['CustomerRequestedDate'] == '2024-02-01')][['ItemNum', 'QtyOnHand']].drop_duplicates()
+final_results_df = final_results_df.merge(qty_on_hand_feb, on='ItemNum', how='left')
+
+# Add most recent values for additional columns
+columns_to_include = ['CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'ActualLeadTime', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SupplierID', 'CountryOfOrigin']
+most_recent_values = orders_by_month.sort_values(by='CustomerRequestedDate').groupby('ItemNum').tail(1)[['ItemNum'] + columns_to_include]
+
+final_results_df = final_results_df.merge(most_recent_values, on='ItemNum', how='left')
+
+# Prepare the actuals data for the months we are predicting (February to May 2024)
+actuals_data = orders_by_month[(orders_by_month['CustomerRequestedDate'] >= '2024-02-01') & 
+                               (orders_by_month['CustomerRequestedDate'] < '2024-06-01')]
+
+# Calculate total actuals for each item by month
+actuals_total = actuals_data.groupby(['ItemNum', actuals_data['CustomerRequestedDate'].dt.to_period('M')])['OrderQty'].sum().reset_index()
+actuals_total.columns = ['ItemNum', 'Month', 'ActualOrderQty']
+
+# Ensure the 'Month' column is in datetime format
+actuals_total['Month'] = actuals_total['Month'].dt.to_timestamp()
+
+# Merge actual order quantities with the predictions
+final_results_df['Month'] = pd.to_datetime(final_results_df['Month'])
+final_results_df = final_results_df.merge(actuals_total, on=['ItemNum', 'Month'], how='left')
+
+# Recalculate MAE including actual order quantities
+final_results_df['MAE'] = final_results_df.apply(lambda row: mean_absolute_error([row['ActualOrderQty']], [row['Prediction']]), axis=1)
+final_results_df_prophet_cnn_lstm = final_results_df.copy()
+# Save the monthly results to CSV
+final_results_df_prophet_cnn_lstm.to_csv("FINAL_RESULTS_COMPARISON_MONTHLY_prophet_cnn_lstm.csv", index=False)
+
+print(f"Final Results (Monthly):\n{final_results_df.head()}")
+
+# Calculate total actuals for each item
+actuals_total_sum = actuals_data.groupby('ItemNum')['OrderQty'].sum().reset_index()
+actuals_total_sum.columns = ['ItemNum', 'TotalActual']
+
+# Calculate total predictions for each item
+total_predictions_sum = final_results_df.groupby('ItemNum')['Prediction'].sum().reset_index()
+total_predictions_sum.columns = ['ItemNum', 'TotalPrediction']
+
+# Merge total actuals and total predictions into the summarized results
+summarized_results = actuals_total_sum.merge(total_predictions_sum, on='ItemNum', how='left')
+
+# Calculate MAE for each item
+summarized_results['MAE'] = summarized_results.apply(lambda row: mean_absolute_error([row['TotalActual']], [row['TotalPrediction']]), axis=1)
+
+# Include additional columns from most recent values
+summarized_results_prophet_cnn_lstm = summarized_results.merge(most_recent_values, on='ItemNum', how='left')
+
+# Save the summarized final results to CSV
+summarized_results_prophet_cnn_lstm.to_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_prophet_cnn_lstm.csv", index=False)
+
+print(f"Final Summarized Results:\n{summarized_results.head()}")
+
+
+##################PROPHET ONLY##########################
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import TimeSeriesSplit
+from statsmodels.tsa.seasonal import STL
+from tqdm import tqdm
+from joblib import Parallel, delayed
+from prophet import Prophet
+from sklearn.metrics import mean_absolute_error
+
+# Load and preprocess data
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month['CustomerRequestedDate'] = pd.to_datetime(orders_by_month['CustomerRequestedDate'])
+orders_by_month_reduced = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-02-01']
+monthly_data = orders_by_month_reduced.groupby(['CustomerRequestedDate', 'ItemNum']).sum().reset_index()
+
+# Prophet Model Training and Prediction
+orders_by_month_sampled = orders_by_month_reduced
+seasonal_items = []
+non_seasonal_items = []
+
+def check_seasonality_stl(item_data, threshold=4):
+    item_data = item_data.set_index('CustomerRequestedDate')['OrderQty']
+    item_data = item_data.asfreq('MS').dropna()
+    stl = STL(item_data)
+    result = stl.fit()
+    seasonal_strength = result.seasonal.std() / result.trend.std()
+    return seasonal_strength > threshold
+
+def process_item(item_num, func, threshold):
+    item_data = orders_by_month_sampled[orders_by_month_sampled['ItemNum'] == item_num]
+    try:
+        if func(item_data, threshold=threshold):
+            return item_num, True
+        else:
+            return item_num, False
+    except Exception as e:
+        return item_num, False
+
+processed_items = Parallel(n_jobs=-1)(delayed(process_item)(item_num, check_seasonality_stl, 4) for item_num in tqdm(orders_by_month_sampled['ItemNum'].unique()))
+for item_num, is_seasonal in processed_items:
+    if is_seasonal:
+        seasonal_items.append(item_num)
+    else:
+        non_seasonal_items.append(item_num)
+
+def handle_spikes_mad(df, threshold=7):
+    median_qty = df['OrderQty'].median()
+    mad_qty = np.median(np.abs(df['OrderQty'] - median_qty))
+    spike_threshold_upper = median_qty + threshold * mad_qty
+    spike_threshold_lower = median_qty - threshold * mad_qty
+    spikes_removed = df[(df['OrderQty'] > spike_threshold_upper) | (df['OrderQty'] < spike_threshold_lower)]
+    
+    df['OrderQty_cleaned'] = np.where((df['OrderQty'] > spike_threshold_upper) | (df['OrderQty'] < spike_threshold_lower), median_qty, df['OrderQty'])
+    return df[['CustomerRequestedDate', 'ItemNum', 'OrderQty_cleaned']], spikes_removed[['CustomerRequestedDate', 'ItemNum', 'OrderQty']]
+
+def process_spikes(item_num):
+    item_data = orders_by_month_sampled[orders_by_month_sampled['ItemNum'] == item_num].copy()
+    cleaned_data, spikes_removed = handle_spikes_mad(item_data)
+    return cleaned_data, spikes_removed
+
+results = Parallel(n_jobs=-1)(delayed(process_spikes)(item_num) for item_num in tqdm(non_seasonal_items))
+non_seasonal_cleaned_mad = pd.concat([res[0] for res in results])
+spikes_info_mad = pd.concat([res[1] for res in results])
+
+orders_by_month_cleaned = pd.concat([orders_by_month_sampled[orders_by_month_sampled['ItemNum'].isin(seasonal_items)], non_seasonal_cleaned_mad])
+orders_by_month_cleaned['OrderQty'] = np.where(orders_by_month_cleaned['OrderQty_cleaned'].isna(), orders_by_month_cleaned['OrderQty'], orders_by_month_cleaned['OrderQty_cleaned'])
+orders_by_month_cleaned.drop(columns=['OrderQty_cleaned'], inplace=True)
+
+def predict_with_prophet(item_num, data):
+    item_data = data[data['ItemNum'] == item_num][['CustomerRequestedDate', 'OrderQty']]
+    item_data.columns = ['ds', 'y']
+    
+    tscv = TimeSeriesSplit(n_splits=5)
+    best_mae = float('inf')
+    best_predictions = None
+    
+    if len(item_data) < 6:
+        return None
+    
+    for train_index, test_index in tscv.split(item_data):
+        train_data = item_data.iloc[train_index]
+        test_data = item_data.iloc[test_index]
+        
+        if len(test_data) == 0:
+            continue
+        
+        try:
+            model = Prophet()
+            model.fit(train_data)
+            future = model.make_future_dataframe(periods=len(test_data), freq='MS')
+            forecast = model.predict(future)
+            
+            y_true = test_data['y'].values
+            y_pred = forecast.loc[forecast['ds'].isin(test_data['ds']), 'yhat'].values
+            
+            if len(y_true) != len(y_pred):
+                continue
+            
+            mae = mean_absolute_error(y_true, y_pred)
+            
+            if mae < best_mae:
+                best_mae = mae
+                best_predictions = y_pred
+        
+        except Exception as e:
+            continue
+    
+    return best_predictions
+
+def evaluate_predictive_power(item_num, data):
+    predictions = predict_with_prophet(item_num, data)
+    return predictions
+
+prophet_predictions = Parallel(n_jobs=-1)(delayed(evaluate_predictive_power)(item_num, orders_by_month_cleaned) for item_num in tqdm(orders_by_month_cleaned['ItemNum'].unique()))
+
+prophet_predictions_dict = {item_num: pred for item_num, pred in zip(orders_by_month_cleaned['ItemNum'].unique(), prophet_predictions)}
+
+# Compile Prophet Predictions into Final Results
+final_results = []
+
+for item_num, predictions in prophet_predictions_dict.items():
+    if predictions is not None:
+        final_results.extend([{
+            'ItemNum': item_num,
+            'Month': pd.date_range(start='2024-02-01', periods=len(predictions), freq='MS')[i],
+            'Prediction': predictions[i],
+        } for i in range(len(predictions))])
+
+final_results_df = pd.DataFrame(final_results)
+
+# Add QtyOnHand for February 2024
+qty_on_hand_feb = orders_by_month[(orders_by_month['CustomerRequestedDate'] == '2024-02-01')][['ItemNum', 'QtyOnHand']].drop_duplicates()
+final_results_df = final_results_df.merge(qty_on_hand_feb, on='ItemNum', how='left')
+
+# Add most recent values for additional columns
+columns_to_include = ['CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'ActualLeadTime', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SupplierID', 'CountryOfOrigin']
+most_recent_values = orders_by_month.sort_values(by='CustomerRequestedDate').groupby('ItemNum').tail(1)[['ItemNum'] + columns_to_include]
+
+final_results_df = final_results_df.merge(most_recent_values, on='ItemNum', how='left')
+
+# Prepare the actuals data for the months we are predicting (February to May 2024)
+actuals_data = orders_by_month[(orders_by_month['CustomerRequestedDate'] >= '2024-02-01') & 
+                               (orders_by_month['CustomerRequestedDate'] < '2024-06-01')]
+
+# Calculate total actuals for each item by month
+actuals_total = actuals_data.groupby(['ItemNum', actuals_data['CustomerRequestedDate'].dt.to_period('M')])['OrderQty'].sum().reset_index()
+actuals_total.columns = ['ItemNum', 'Month', 'ActualOrderQty']
+
+# Ensure the 'Month' column is in datetime format
+actuals_total['Month'] = actuals_total['Month'].dt.to_timestamp()
+
+# Merge actual order quantities with the predictions
+final_results_df['Month'] = pd.to_datetime(final_results_df['Month'])
+final_results_df = final_results_df.merge(actuals_total, on=['ItemNum', 'Month'], how='left')
+
+# Recalculate MAE including actual order quantities
+final_results_df['MAE'] = final_results_df.apply(lambda row: mean_absolute_error([row['ActualOrderQty']], [row['Prediction']]), axis=1)
+
+final_results_df_PROPHET_ONLY = final_results_df.copy()
+
+# Save the monthly results to CSV
+final_results_df_PROPHET_ONLY.to_csv("FINAL_RESULTS_COMPARISON_MONTHLY_PROPHET_ONLY.csv", index=False)
+
+print(f"Final Results (Monthly):\n{final_results_df.head()}")
+
+# Calculate total actuals for each item
+actuals_total_sum = actuals_data.groupby('ItemNum')['OrderQty'].sum().reset_index()
+actuals_total_sum.columns = ['ItemNum', 'TotalActual']
+
+# Calculate total predictions for each item
+total_predictions_sum = final_results_df.groupby('ItemNum')['Prediction'].sum().reset_index()
+total_predictions_sum.columns = ['ItemNum', 'TotalPrediction']
+
+# Merge total actuals and total predictions into the summarized results
+summarized_results = actuals_total_sum.merge(total_predictions_sum, on='ItemNum', how='left')
+
+# Calculate MAE for each item
+summarized_results['MAE'] = summarized_results.apply(lambda row: mean_absolute_error([row['TotalActual']], [row['TotalPrediction']]), axis=1)
+
+# Include additional columns from most recent values
+summarized_results_PROPHET_ONLY = summarized_results.merge(most_recent_values, on='ItemNum', how='left')
+
+# Save the summarized final results to CSV
+summarized_results_PROPHET_ONLY.to_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_PROPHET_ONLY.csv", index=False)
+
+print(f"Final Summarized Results:\n{summarized_results.head()}")
+
+
+
+
+############################# ARIMA/SARIMA
+
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+from tqdm import tqdm
+from joblib import Parallel, delayed
+from sklearn.metrics import mean_absolute_error
+
+# Load and preprocess data
+orders_by_month = pd.read_csv("orders_by_month_1.csv", parse_dates=['CustomerRequestedDate'])
+orders_by_month['CustomerRequestedDate'] = pd.to_datetime(orders_by_month['CustomerRequestedDate'])
+orders_by_month_reduced = orders_by_month[orders_by_month['CustomerRequestedDate'] < '2024-02-01']
+
+# Function to predict using ARIMA
+def predict_with_arima(item_num, data):
+    item_data = data[data['ItemNum'] == item_num].set_index('CustomerRequestedDate')['OrderQty'].asfreq('MS').dropna()
+    
+    if len(item_data) < 12:  # Not enough data to fit ARIMA
+        return None
+    
+    try:
+        model = ARIMA(item_data, order=(1,1,1))
+        model_fit = model.fit(disp=False)
+        forecast = model_fit.get_forecast(steps=4)
+        return forecast.predicted_mean.values
+    except Exception as e:
+        return None
+
+# Predict for all items
+def evaluate_predictive_power(item_num, data):
+    predictions = predict_with_arima(item_num, data)
+    return predictions
+
+arima_predictions = Parallel(n_jobs=-1)(
+    delayed(evaluate_predictive_power)(item_num, orders_by_month_reduced)
+    for item_num in tqdm(orders_by_month_reduced['ItemNum'].unique())
+)
+
+# Combine results into final DataFrame
+final_results = []
+
+prediction_months = pd.date_range(start='2024-02-01', periods=4, freq='MS')
+
+for item_num, predictions in zip(orders_by_month_reduced['ItemNum'].unique(), arima_predictions):
+    if predictions is not None:  # Check if the prediction is not None
+        final_results.extend([{
+            'ItemNum': item_num,
+            'Month': prediction_months[i],
+            'Prediction': predictions[i]
+        } for i in range(len(predictions))])
+    else:
+        print(f"No predictions for ItemNum: {item_num}")  # Debugging output
+
+final_results_df = pd.DataFrame(final_results)
+
+# Add QtyOnHand for February 2024
+qty_on_hand_feb = orders_by_month[(orders_by_month['CustomerRequestedDate'] == '2024-02-01')][['ItemNum', 'QtyOnHand']].drop_duplicates()
+final_results_df = final_results_df.merge(qty_on_hand_feb, on='ItemNum', how='left')
+
+# Add most recent values for additional columns
+columns_to_include = ['CostUSD_per_unit', 'MarginUSD_per_unit', 'PriceUSD_per_unit', 'ActualLeadTime', 'MinimumOrderQuantity', 'MaximumOrderQuantity', 'SupplierID', 'CountryOfOrigin']
+most_recent_values = orders_by_month.sort_values(by='CustomerRequestedDate').groupby('ItemNum').tail(1)[['ItemNum'] + columns_to_include]
+
+final_results_df = final_results_df.merge(most_recent_values, on='ItemNum', how='left')
+
+# Prepare the actuals data for the months we are predicting (February to May 2024)
+actuals_data = orders_by_month[(orders_by_month['CustomerRequestedDate'] >= '2024-02-01') & 
+                               (orders_by_month['CustomerRequestedDate'] < '2024-06-01')]
+
+# Calculate total actuals for each item by month
+actuals_total = actuals_data.groupby(['ItemNum', actuals_data['CustomerRequestedDate'].dt.to_period('M')])['OrderQty'].sum().reset_index()
+actuals_total.columns = ['ItemNum', 'Month', 'ActualOrderQty']
+
+# Ensure the 'Month' column is in datetime format
+actuals_total['Month'] = actuals_total['Month'].dt.to_timestamp()
+
+# Merge actual order quantities with the predictions
+final_results_df['Month'] = pd.to_datetime(final_results_df['Month'])
+final_results_df = final_results_df.merge(actuals_total, on=['ItemNum', 'Month'], how='left')
+
+# Recalculate MAE including actual order quantities
+final_results_df['MAE'] = final_results_df.apply(lambda row: mean_absolute_error([row['ActualOrderQty']], [row['Prediction']]) if pd.notnull(row['ActualOrderQty']) and pd.notnull(row['Prediction']) else np.nan, axis=1)
+
+final_results_df_arima = final_results_df.copy()
+
+# Save the monthly results to CSV
+final_results_df_arima.to_csv("FINAL_RESULTS_COMPARISON_MONTHLY_arima.csv", index=False)
+
+print(f"Final Results (Monthly):\n{final_results_df.head()}")
+
+# Calculate total actuals for each item
+actuals_total_sum = actuals_data.groupby('ItemNum')['OrderQty'].sum().reset_index()
+actuals_total_sum.columns = ['ItemNum', 'TotalActual']
+
+# Calculate total predictions for each item
+total_predictions_sum = final_results_df.groupby('ItemNum')['Prediction'].sum().reset_index()
+total_predictions_sum.columns = ['ItemNum', 'TotalPrediction']
+
+# Merge total actuals and total predictions into the summarized results
+summarized_results = actuals_total_sum.merge(total_predictions_sum, on='ItemNum', how='left')
+
+# Calculate MAE for each item
+summarized_results['MAE'] = summarized_results.apply(lambda row: mean_absolute_error([row['TotalActual']], [row['TotalPrediction']]) if pd.notnull(row['TotalActual']) and pd.notnull(row['TotalPrediction']) else np.nan, axis=1)
+
+# Include additional columns from most recent values
+summarized_results_arima = summarized_results.merge(most_recent_values, on='ItemNum', how='left')
+
+# Save the summarized final results to CSV
+summarized_results_arima.to_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_arima.csv", index=False)
+
+print(f"Final Summarized Results:\n{summarized_results.head()}")
+
+# Visuals/graphics/figures
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.table import Table
+
+# Load the final results for each model
+cnn_lstm_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_CNN_LSTM_ONLY.csv")
+prophet_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_PROPHET_ONLY.csv")
+historic_moving_avg_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_HISTORIC_MOVING_AVERAGE.csv")
+les_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_LES.csv")
+prophet_cnn_lstm_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_prophet_cnn_lstm.csv")
+ARIMA_SARIMA_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_arima_sarima.csv")
+lgbm_results = pd.read_csv("FINAL_RESULTS_COMPARISON_SUMMARIZED_LGBM.csv")
+
+# Function to process dataframes
+def process_dataframe(df):
+    df['TotalPrediction'] = df['TotalPrediction'].clip(lower=0)
+    df['DIFF'] = df['TotalPrediction'] - df['TotalActual']
+    df['DIFF_VALUE'] = df['DIFF'] * df['PriceUSD_per_unit']
+    df['ABS_DIFF'] = df['DIFF'].abs()
+    df['ABS_DIFF_VALUE'] = df['ABS_DIFF'] * df['PriceUSD_per_unit']
+    return df
+
+# Process each dataframe
+cnn_lstm_results = process_dataframe(cnn_lstm_results)
+prophet_results = process_dataframe(prophet_results)
+historic_moving_avg_results = process_dataframe(historic_moving_avg_results)
+les_results = process_dataframe(les_results)
+prophet_cnn_lstm_results = process_dataframe(prophet_cnn_lstm_results)
+ARIMA_SARIMA_results = process_dataframe(ARIMA_SARIMA_results)
+lgbm_results = process_dataframe(lgbm_results)
+
+# Calculate metrics for each model
+models = [
+    "CNN-LSTM", 
+    "Prophet", 
+    "CNN-LSTM_Prophet", 
+    "Historic Moving Average", 
+    "LES", 
+    "LightGBM", 
+    "ARIMA_SARIMA"
+]
+
+average_mae = [
+    cnn_lstm_results['MAE'].mean(),
+    prophet_results['MAE'].mean(),
+    prophet_cnn_lstm_results['MAE'].mean(),
+    historic_moving_avg_results['MAE'].mean(),
+    les_results['MAE'].mean(),
+    lgbm_results['MAE'].mean(),
+    ARIMA_SARIMA_results['MAE'].mean()
+]
+
+total_absolute_error = [
+    cnn_lstm_results['ABS_DIFF_VALUE'].sum(),
+    prophet_results['ABS_DIFF_VALUE'].sum(),
+    prophet_cnn_lstm_results['ABS_DIFF_VALUE'].sum(),
+    historic_moving_avg_results['ABS_DIFF_VALUE'].sum(),
+    les_results['ABS_DIFF_VALUE'].sum(),
+    lgbm_results['ABS_DIFF_VALUE'].sum(),
+    ARIMA_SARIMA_results['ABS_DIFF_VALUE'].sum()
+]
+
+# Convert total absolute error to million USD for better readability
+total_absolute_error_million = [value / 1e6 for value in total_absolute_error]
+
+# Create a DataFrame for the table
+results_df = pd.DataFrame({
+    "Forecast Model": models,
+    "Absolute Value Difference in USD": total_absolute_error_million,
+    "Average MAE": average_mae
+})
+
+# Sort the DataFrame by Total Absolute Error in descending order
+results_df = results_df.sort_values(by='Absolute Value Difference in USD', ascending=False)
+
+# Function to create the performance table
+def create_performance_table(df):
+    fig, ax = plt.subplots(figsize=(20, 8))
+    ax.set_axis_off()
+    tbl = Table(ax, bbox=[0, 0, 1, 1])
+
+    n_rows, n_cols = df.shape
+    width, height = 1.0 / n_cols, 1.0 / (n_rows + 1)
+
+    # Add headers
+    for i, column in enumerate(df.columns):
+        cell = tbl.add_cell(0, i, width, height, text=column, loc='center', facecolor='lightgrey')
+        cell.get_text().set_fontsize(14)
+
+    # Add data rows
+    for row in range(n_rows):
+        for col in range(n_cols):
+            cell = tbl.add_cell(row + 1, col, width, height, text=f"{df.iat[row, col]:,.2f}" if isinstance(df.iat[row, col], float) else df.iat[row, col], loc='center', facecolor='white')
+            cell.get_text().set_fontsize(14)
+
+    ax.add_table(tbl)
+    plt.title("Demand Plan Accuracy From FEB24 to MAY24 (Ranked)", fontsize=24, weight='bold')
+    plt.show()
+
+# Create the performance table using the sorted data
+create_performance_table(results_df)
+
+# Plot Average MAE
+plt.figure(figsize=(12, 8))
+plt.bar(results_df['Forecast Model'], results_df['Average MAE'], color='skyblue')
+plt.title('Average MAE Comparison Across Models (Ranked)')
+plt.xlabel('Model')
+plt.ylabel('Average MAE')
+plt.xticks(rotation=45)
+plt.show()
+
+# Plot Total Absolute Error in USD
+plt.figure(figsize=(12, 8))
+plt.bar(results_df['Forecast Model'], results_df['Absolute Value Difference in USD'], color='lightcoral')
+plt.title('Total Absolute Error (in USD) Comparison Across Models (Ranked)')
+plt.xlabel('Model')
+plt.ylabel('Total Absolute Error (Million USD)')
+plt.xticks(rotation=45)
+
+# Format y-axis with commas for readability
+plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}M'))
+
+plt.show()
